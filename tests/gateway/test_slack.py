@@ -2634,6 +2634,37 @@ class TestThreadReplyHandling:
         adapter_with_session_store.handle_message.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_prefetch_thread_context_before_ignoring_unowned_thread(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """cookie.alter parity: thread root/prior replies are read before routing judgement."""
+        adapter_with_session_store.config.extra["prefetch_thread_context_for_routing"] = True
+        mock_session_store._entries = {}
+        adapter_with_session_store._app.client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"text": "root context", "user": "U_OWNER", "ts": "123.000"},
+                {"text": "current", "user": "U_USER", "ts": "123.456"},
+            ]
+        })
+
+        event = {
+            "text": "Just replying in the thread",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store._app.client.conversations_replies.assert_awaited_once_with(
+            channel="C123", ts="123.000", limit=31, inclusive=True
+        )
+        adapter_with_session_store.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_thread_reply_without_mention_with_session_processed(
         self, adapter_with_session_store, mock_session_store
     ):
@@ -2657,6 +2688,159 @@ class TestThreadReplyHandling:
         # Verify the text is passed through unchanged (no mention stripping needed)
         msg_event = adapter_with_session_store.handle_message.call_args[0][0]
         assert msg_event.text == "Follow-up question"
+
+    @pytest.mark.asyncio
+    async def test_alter_thread_heuristic_reacts_in_multi_human_thread(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """cookie.alter parity: multi-human active threads wait for a fresh mention."""
+        adapter_with_session_store.config.extra["alter_thread_heuristic"] = True
+        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        mock_session_store._entries = {session_key: MagicMock()}
+        adapter_with_session_store._bot_message_ts.add("123.000")
+        adapter_with_session_store._app.client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"text": "<@U_BOT> root", "user": "U_OWNER", "ts": "123.000"},
+                {"text": "first", "user": "U_USER", "ts": "123.111"},
+                {"text": "second", "user": "U_OTHER", "ts": "123.456"},
+            ]
+        })
+        adapter_with_session_store._app.client.reactions_add = AsyncMock()
+
+        event = {
+            "text": "I am joining too",
+            "user": "U_OTHER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_not_called()
+        adapter_with_session_store._app.client.reactions_add.assert_awaited_once_with(
+            channel="C123", timestamp="123.456", name="eyes"
+        )
+
+    @pytest.mark.asyncio
+    async def test_alter_thread_heuristic_allows_one_human_thread(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """cookie.alter parity: one-human active threads keep the smooth follow-up UX."""
+        adapter_with_session_store.config.extra["alter_thread_heuristic"] = True
+        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        mock_session_store._entries = {session_key: MagicMock()}
+        adapter_with_session_store._app.client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"text": "<@U_BOT> root", "user": "U_USER", "ts": "123.000"},
+                {"text": "follow-up", "user": "U_USER", "ts": "123.456"},
+            ]
+        })
+
+        event = {
+            "text": "Follow-up question",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_called_once()
+        assert adapter_with_session_store._app.client.conversations_replies.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_mentioning_other_bot_in_active_thread_responds(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """Bot-to-bot work parity: active threads may continue even when another bot is addressed."""
+        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        mock_session_store._entries = {session_key: MagicMock()}
+        adapter_with_session_store._mentioned_threads.add("123.000")
+        adapter_with_session_store._app.client.users_info = AsyncMock(return_value={
+            "user": {"is_bot": True, "is_app_user": True, "profile": {"display_name": "cookie.alter"}}
+        })
+        adapter_with_session_store._app.client.reactions_add = AsyncMock()
+
+        event = {
+            "text": "<@UOTHERBOT> can you handle this?",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_called_once()
+        adapter_with_session_store._app.client.reactions_add.assert_not_called()
+        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
+        assert msg_event.text == "<@UOTHERBOT> can you handle this?"
+
+    @pytest.mark.asyncio
+    async def test_bot_authored_thread_reply_in_active_thread_responds_when_allowed(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """Bot-to-bot work parity: configured bot inbound can continue active threads."""
+        adapter_with_session_store.config.extra["allow_bots"] = "all"
+        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        mock_session_store._entries = {session_key: MagicMock()}
+        adapter_with_session_store._mentioned_threads.add("123.000")
+
+        event = {
+            "text": "좋아, 다음 액션은 context parser schema 확정이야",
+            "user": "UOTHERBOT",
+            "bot_id": "BOTHERBOT",
+            "channel": "C123",
+            "ts": "123.789",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_called_once()
+        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
+        assert msg_event.text == "좋아, 다음 액션은 context parser schema 확정이야"
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_with_hermes_and_other_bot_mentions_still_responds(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """Direct Hermes mention wins even if another bot is also mentioned."""
+        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        mock_session_store._entries = {session_key: MagicMock()}
+        adapter_with_session_store._app.client.users_info = AsyncMock(return_value={
+            "user": {"is_bot": True, "is_app_user": True}
+        })
+
+        event = {
+            "text": "<@U_BOT> please coordinate with <@UOTHERBOT>",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_called_once()
+        assert all(
+            call.kwargs.get("user") != "UOTHERBOT"
+            for call in adapter_with_session_store._app.client.users_info.await_args_list
+        )
+        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
+        assert msg_event.text == "please coordinate with <@UOTHERBOT>"
 
     @pytest.mark.asyncio
     async def test_thread_reply_with_mention_strips_bot_id(

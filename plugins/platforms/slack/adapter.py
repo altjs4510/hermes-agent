@@ -77,6 +77,7 @@ class _ThreadContextCache:
     fetched_at: float = field(default_factory=time.monotonic)
     message_count: int = 0
     parent_text: str = ""  # Raw text of the thread parent (for reply_to_text injection)
+    human_count: Optional[int] = None
 
 
 def check_slack_requirements() -> bool:
@@ -334,6 +335,7 @@ class SlackAdapter(BasePlatformAdapter):
         self._handler: Optional[Any] = None
         self._bot_user_id: Optional[str] = None
         self._user_name_cache: Dict[str, str] = {}  # user_id → display name
+        self._user_is_bot_cache: Dict[Tuple[str, str], bool] = {}  # (team_id, user_id) → bot/app user
         self._socket_mode_task: Optional[asyncio.Task] = None
         # Multi-workspace support
         self._team_clients: Dict[str, Any] = {}  # team_id → WebClient
@@ -1751,6 +1753,63 @@ class SlackAdapter(BasePlatformAdapter):
 
     # ----- User identity resolution -----
 
+    def _extract_user_mentions(self, text: str) -> set[str]:
+        """Extract Slack user IDs from <@U...> mention entities."""
+        if not text:
+            return set()
+        return set(re.findall(r"<@([A-Z0-9]+)(?:\|[^>]+)?>", text))
+
+    async def _is_slack_bot_user(
+        self,
+        user_id: str,
+        *,
+        chat_id: str = "",
+        team_id: str = "",
+    ) -> bool:
+        """Return True when a Slack user ID represents a bot/app user."""
+        if not user_id:
+            return False
+        cache_key = (team_id or "", user_id)
+        if cache_key in self._user_is_bot_cache:
+            return self._user_is_bot_cache[cache_key]
+        if not self._app:
+            return False
+        try:
+            client = self._get_client(chat_id) if chat_id else self._app.client
+            result = await client.users_info(user=user_id)
+            user = result.get("user", {}) if isinstance(result, dict) else {}
+            is_bot = bool(user.get("is_bot") or user.get("is_app_user"))
+            self._user_is_bot_cache[cache_key] = is_bot
+            return is_bot
+        except Exception:
+            logger.debug(
+                "[Slack] users.info failed while checking bot mention for %s",
+                user_id,
+                exc_info=True,
+            )
+            return False
+
+    async def _mentions_other_bot(
+        self,
+        text: str,
+        *,
+        bot_uid: str,
+        channel_id: str,
+        team_id: str = "",
+    ) -> bool:
+        """Detect messages addressed to another Slack bot but not this bot."""
+        mentioned_user_ids = self._extract_user_mentions(text)
+        if bot_uid:
+            mentioned_user_ids.discard(bot_uid)
+        for user_id in mentioned_user_ids:
+            if await self._is_slack_bot_user(
+                user_id,
+                chat_id=channel_id,
+                team_id=team_id,
+            ):
+                return True
+        return False
+
     async def _resolve_user_name(self, user_id: str, chat_id: str = "") -> str:
         """Resolve a Slack user ID to a display name, with caching."""
         if not user_id:
@@ -2266,7 +2325,8 @@ class SlackAdapter(BasePlatformAdapter):
         #   "none"     — ignore all bot messages (default, backward-compatible)
         #   "mentions" — accept bot messages only when they @mention us
         #   "all"      — accept all bot messages (except our own)
-        if event.get("bot_id") or event.get("subtype") == "bot_message":
+        is_bot_message = bool(event.get("bot_id") or event.get("subtype") == "bot_message")
+        if is_bot_message:
             allow_bots = self.config.extra.get("allow_bots", "")
             if not allow_bots:
                 allow_bots = os.getenv("SLACK_ALLOW_BOTS", "none")
@@ -2491,6 +2551,24 @@ class SlackAdapter(BasePlatformAdapter):
         )
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
+        prefetched_thread_context = ""
+        if (
+            not is_dm
+            and is_thread_reply
+            and event_thread_ts
+            and self._slack_prefetch_thread_context_for_routing()
+        ):
+            # cookie.alter parity: when a Slack thread is involved, read the
+            # root + prior replies before deciding whether to respond/react.
+            # This also warms the per-thread cache for participant counting and
+            # later context injection, avoiding duplicate conversations.replies
+            # calls in the common path.
+            prefetched_thread_context = await self._fetch_thread_context(
+                channel_id=channel_id,
+                thread_ts=event_thread_ts,
+                current_ts=ts,
+                team_id=team_id,
+            )
 
         if not is_dm and bot_uid:
             # Check allowed channels — if set, only respond in these channels (whitelist)
@@ -2527,6 +2605,27 @@ class SlackAdapter(BasePlatformAdapter):
                 ):
                     return
 
+                # cookie.alter parity mode: a bot-owned/active thread should not
+                # become a free-for-all auto-response surface once multiple
+                # humans join.  In that case we acknowledge with 👀 and wait for
+                # a direct mention instead of entering the agent/tool lifecycle.
+                if self._slack_alter_thread_heuristic() and is_thread_reply:
+                    human_count = await self._thread_human_participant_count(
+                        channel_id=channel_id,
+                        thread_ts=event_thread_ts or "",
+                        team_id=team_id,
+                    )
+                    if human_count is not None and human_count > 1:
+                        if self._reactions_enabled():
+                            await self._add_reaction(channel_id, ts, "eyes")
+                        logger.debug(
+                            "[Slack] alter thread heuristic: reacting instead of responding "
+                            "in multi-human thread %s (humans=%d)",
+                            event_thread_ts,
+                            human_count,
+                        )
+                        return
+
         if is_mentioned:
             # Strip the bot mention from the text
             text = text.replace(f"<@{bot_uid}>", "").strip()
@@ -2550,12 +2649,14 @@ class SlackAdapter(BasePlatformAdapter):
             thread_ts=event_thread_ts,
             user_id=user_id,
         ):
-            thread_context = await self._fetch_thread_context(
-                channel_id=channel_id,
-                thread_ts=event_thread_ts,
-                current_ts=ts,
-                team_id=team_id,
-            )
+            thread_context = prefetched_thread_context
+            if not thread_context:
+                thread_context = await self._fetch_thread_context(
+                    channel_id=channel_id,
+                    thread_ts=event_thread_ts or "",
+                    current_ts=ts,
+                    team_id=team_id,
+                )
             if thread_context:
                 text = thread_context + text
 
@@ -2795,6 +2896,7 @@ class SlackAdapter(BasePlatformAdapter):
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_ts,
+            is_bot=is_bot_message,
         )
 
         # Per-channel ephemeral prompt
@@ -3302,6 +3404,53 @@ class SlackAdapter(BasePlatformAdapter):
 
         # (approval state already consumed by atomic pop above)
 
+    async def _thread_human_participant_count(
+        self, channel_id: str, thread_ts: str, team_id: str = "", limit: int = 50,
+    ) -> Optional[int]:
+        """Return the number of distinct human users visible in a Slack thread.
+
+        Used by the cookie.alter parity heuristic: when multiple humans are in
+        a bot-owned/active thread, Hermes should react and wait for an explicit
+        mention rather than auto-answer every reply.
+        """
+        if not channel_id or not thread_ts:
+            return None
+        cache_key = f"{channel_id}:{thread_ts}:{team_id}"
+        now = time.monotonic()
+        cached = self._thread_context_cache.get(cache_key)
+        if (
+            cached
+            and (now - cached.fetched_at) < self._THREAD_CACHE_TTL
+            and cached.human_count is not None
+        ):
+            return cached.human_count
+        try:
+            client = self._get_client(channel_id)
+            result = await client.conversations_replies(
+                channel=channel_id,
+                ts=thread_ts,
+                limit=limit,
+                inclusive=True,
+            )
+            messages = result.get("messages", []) if result else []
+            bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+            humans = set()
+            for msg in messages:
+                user = msg.get("user")
+                if not user or user == bot_uid:
+                    continue
+                if msg.get("bot_id") or msg.get("subtype") == "bot_message":
+                    continue
+                humans.add(user)
+            human_count = len(humans)
+            existing = self._thread_context_cache.get(cache_key)
+            if existing:
+                existing.human_count = human_count
+            return human_count
+        except Exception as exc:
+            logger.debug("[Slack] Failed to count thread participants: %s", exc)
+            return None
+
     # ----- Thread context fetching -----
 
     async def _fetch_thread_context(
@@ -3376,6 +3525,7 @@ class SlackAdapter(BasePlatformAdapter):
             bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
             context_parts = []
             parent_text = ""
+            human_users = set()
             for msg in messages:
                 msg_ts = msg.get("ts", "")
                 # Exclude the current triggering message — it will be delivered
@@ -3386,6 +3536,8 @@ class SlackAdapter(BasePlatformAdapter):
                 is_parent = msg_ts == thread_ts
                 is_bot = bool(msg.get("bot_id")) or msg.get("subtype") == "bot_message"
                 msg_user = msg.get("user", "")
+                if msg_user and msg_user != bot_uid and not is_bot:
+                    human_users.add(msg_user)
 
                 # Identify "our own" bot for this workspace (multi-workspace safe).
                 msg_team = msg.get("team") or team_id
@@ -3437,6 +3589,7 @@ class SlackAdapter(BasePlatformAdapter):
                 fetched_at=now,
                 message_count=len(context_parts),
                 parent_text=parent_text,
+                human_count=len(human_users),
             )
             return content
 
@@ -3744,6 +3897,38 @@ class SlackAdapter(BasePlatformAdapter):
                     raise
 
     # ── Channel mention gating ─────────────────────────────────────────────
+
+    def _slack_alter_thread_heuristic(self) -> bool:
+        """Opt-in cookie.alter-style thread routing.
+
+        When enabled, non-mentioned replies in bot-owned/active channel threads
+        are auto-answered only while the visible human participant set is <= 1.
+        Multi-human threads receive a lightweight reaction and wait for a fresh
+        direct mention. Defaults off for upstream compatibility.
+        """
+        configured = self.config.extra.get("alter_thread_heuristic")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("SLACK_ALTER_THREAD_HEURISTIC", "false").lower() in {"true", "1", "yes", "on"}
+
+    def _slack_prefetch_thread_context_for_routing(self) -> bool:
+        """Return whether Slack thread root/prior replies are fetched before routing.
+
+        This is the cookie.alter parity guard against latest-message tunnel
+        vision.  When enabled, thread replies warm the context cache before
+        mention/session/participant routing decides respond vs react vs ignore.
+        """
+        configured = self.config.extra.get("prefetch_thread_context_for_routing")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        env_value = os.getenv("SLACK_PREFETCH_THREAD_CONTEXT_FOR_ROUTING")
+        if env_value is not None:
+            return env_value.lower() in {"true", "1", "yes", "on"}
+        return self._slack_alter_thread_heuristic()
 
     def _slack_require_mention(self) -> bool:
         """Return whether channel messages require an explicit bot mention.
