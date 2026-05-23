@@ -69,6 +69,7 @@ import plugins.platforms.slack.adapter as _slack_mod
 _slack_mod.SLACK_AVAILABLE = True
 
 from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from gateway.owner_confirm import OwnerConfirmStore  # noqa: E402
 
 
 async def _pending_for_fake_task():
@@ -2632,6 +2633,295 @@ class TestThreadReplyHandling:
         }
         await adapter_with_session_store._handle_slack_message(event)
         adapter_with_session_store.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_owner_confirm_message_confirms_and_executes_latest_proposal(
+        self, adapter_with_session_store, mock_session_store, tmp_path
+    ):
+        """owner-confirm: Slack thread approval validates latest proposed event without LLM routing."""
+        audit_path = tmp_path / "owner-confirm.jsonl"
+        adapter_with_session_store.config.extra["owner_confirm_audit_path"] = str(audit_path)
+        store = OwnerConfirmStore(audit_path)
+        proposed = store.propose(
+            channel="C123",
+            thread_ts="123.000",
+            actor="U_BOT",
+            owner="U_OWNER",
+            action_class="send",
+            confirm_verb="전송",
+            token="A17F",
+            target_ref="slack:channel:C123|msg:draft",
+            preview_ref="artifact://preview/1",
+        )
+        adapter_with_session_store._app.client.chat_postMessage = AsyncMock(return_value={"ts": "confirm_reply"})
+        adapter_with_session_store._owner_confirm_executors = {
+            proposed["proposal_id"]: AsyncMock(return_value={
+                "result": "success",
+                "result_code": "OK",
+                "execution_ref": "slack_ts:999.000",
+            })
+        }
+
+        event = {
+            "text": "승인: 전송 #A17F",
+            "user": "U_OWNER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_not_called()
+        adapter_with_session_store._owner_confirm_executors[proposed["proposal_id"]].assert_awaited_once()
+        records = OwnerConfirmStore(audit_path).lookup(proposed["proposal_id"])
+        assert [record["state"] for record in records] == ["proposed", "confirmed", "executed"]
+        assert records[-1]["status"] == "completed"
+        call_kwargs = adapter_with_session_store._app.client.chat_postMessage.call_args.kwargs
+        assert call_kwargs["channel"] == "C123"
+        assert call_kwargs["thread_ts"] == "123.000"
+        assert "실행 완료" in call_kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_owner_confirm_wrong_owner_rejects_without_agent_or_execution(
+        self, adapter_with_session_store, mock_session_store, tmp_path
+    ):
+        """owner-confirm: only the proposal owner can approve state changes."""
+        audit_path = tmp_path / "owner-confirm.jsonl"
+        adapter_with_session_store.config.extra["owner_confirm_audit_path"] = str(audit_path)
+        proposed = OwnerConfirmStore(audit_path).propose(
+            channel="C123",
+            thread_ts="123.000",
+            actor="U_BOT",
+            owner="U_OWNER",
+            action_class="send",
+            confirm_verb="전송",
+            token="A17F",
+            target_ref="slack:channel:C123|msg:draft",
+            preview_ref="artifact://preview/1",
+        )
+        adapter_with_session_store._app.client.chat_postMessage = AsyncMock(return_value={"ts": "reject_reply"})
+        adapter_with_session_store._owner_confirm_executors = {
+            proposed["proposal_id"]: AsyncMock(return_value={"result": "success", "result_code": "OK"})
+        }
+
+        event = {
+            "text": "승인: 전송 #A17F",
+            "user": "U_OTHER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_not_called()
+        adapter_with_session_store._owner_confirm_executors[proposed["proposal_id"]].assert_not_called()
+        records = OwnerConfirmStore(audit_path).lookup(proposed["proposal_id"])
+        assert records[-1]["state"] == "rejected"
+        assert records[-1]["reject_reason"] == "OWNER_MISMATCH"
+        assert "실행 안 됨" in adapter_with_session_store._app.client.chat_postMessage.call_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_owner_confirm_format_failure_replies_without_agent(
+        self, adapter_with_session_store, mock_session_store, tmp_path
+    ):
+        """owner-confirm: malformed 승인: messages do not enter the agent loop."""
+        adapter_with_session_store.config.extra["owner_confirm_audit_path"] = str(tmp_path / "owner-confirm.jsonl")
+        adapter_with_session_store._app.client.chat_postMessage = AsyncMock(return_value={"ts": "reject_reply"})
+
+        event = {
+            "text": "승인: 실행 #A17F",
+            "user": "U_OWNER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_not_called()
+        assert "승인 형식 불일치" in adapter_with_session_store._app.client.chat_postMessage.call_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_owner_confirm_send_metadata_posts_preview_then_confirm_sends_actual(
+        self, adapter_with_session_store, mock_session_store, tmp_path
+    ):
+        """owner-confirm: send(..., owner_confirm=require) registers concrete Slack send executor."""
+        audit_path = tmp_path / "owner-confirm.jsonl"
+        adapter_with_session_store.config.extra["owner_confirm_audit_path"] = str(audit_path)
+        adapter_with_session_store._app.client.chat_postMessage = AsyncMock(
+            side_effect=[
+                {"ts": "preview_ts"},
+                {"ts": "actual_ts"},
+                {"ts": "completion_ts"},
+            ]
+        )
+        adapter_with_session_store._app.client.chat_update = AsyncMock(return_value={"ok": True})
+
+        result = await adapter_with_session_store.send(
+            "C123",
+            "실제 전송될 본문",
+            metadata={
+                "thread_id": "123.000",
+                "owner_confirm": {
+                    "require": True,
+                    "owner": "U_OWNER",
+                    "actor": "U_BOT",
+                    "action_class": "send",
+                    "confirm_verb": "전송",
+                    "token": "BEEF",
+                },
+            },
+        )
+
+        assert result.success is True
+        assert result.message_id == "preview_ts"
+        assert adapter_with_session_store._app.client.chat_postMessage.await_count == 1
+        preview_kwargs = adapter_with_session_store._app.client.chat_postMessage.await_args.kwargs
+        assert "Owner-confirm preview" in preview_kwargs["text"]
+        assert "승인: 전송 #BEEF" in preview_kwargs["text"]
+        assert "실제 전송될 본문" in preview_kwargs["text"]
+        assert preview_kwargs["blocks"][1]["elements"][0]["action_id"] == "hermes_owner_confirm_approve"
+        assert preview_kwargs["blocks"][1]["elements"][1]["action_id"] == "hermes_owner_confirm_cancel"
+        proposal_id = result.raw_response["proposal"]["proposal_id"]
+        assert proposal_id in adapter_with_session_store._owner_confirm_executors
+
+        ack = AsyncMock()
+        await adapter_with_session_store._handle_owner_confirm_action(
+            ack,
+            {
+                "message": {
+                    "ts": "preview_ts",
+                    "thread_ts": "123.000",
+                    "blocks": preview_kwargs["blocks"],
+                },
+                "channel": {"id": "C123"},
+                "user": {"id": "U_OWNER", "name": "Cookie"},
+            },
+            {"action_id": "hermes_owner_confirm_approve", "value": proposal_id},
+        )
+
+        ack.assert_awaited_once()
+        assert adapter_with_session_store._app.client.chat_postMessage.await_count == 3
+        actual_kwargs = adapter_with_session_store._app.client.chat_postMessage.await_args_list[1].kwargs
+        assert actual_kwargs["text"] == "실제 전송될 본문"
+        assert actual_kwargs["thread_ts"] == "123.000"
+        records = OwnerConfirmStore(audit_path).lookup(proposal_id)
+        assert [record["state"] for record in records] == ["proposed", "confirmed", "executed"]
+        assert records[-1]["execution_ref"] == "slack:C123:actual_ts"
+        adapter_with_session_store._app.client.chat_update.assert_awaited_once()
+        assert "✅ 승인됨" in adapter_with_session_store._app.client.chat_update.await_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_owner_confirm_preview_thread_can_differ_from_delivery_dm(
+        self, adapter_with_session_store, mock_session_store, tmp_path
+    ):
+        """owner-confirm: preview stays in requester thread while approval sends to resolved DM."""
+        audit_path = tmp_path / "owner-confirm.jsonl"
+        adapter_with_session_store.config.extra["owner_confirm_audit_path"] = str(audit_path)
+        adapter_with_session_store._app.client.chat_postMessage = AsyncMock(
+            side_effect=[
+                {"ts": "preview_ts"},
+                {"ts": "actual_ts"},
+                {"ts": "completion_ts"},
+            ]
+        )
+        adapter_with_session_store._app.client.chat_update = AsyncMock(return_value={"ok": True})
+
+        result = await adapter_with_session_store.send(
+            "C_ORIGIN",
+            "실제 전송될 본문",
+            metadata={
+                "thread_id": "111.222",
+                "owner_confirm": {
+                    "require": True,
+                    "owner": "U_OWNER",
+                    "actor": "U_OWNER",
+                    "action_class": "send",
+                    "confirm_verb": "전송",
+                    "token": "BEEF",
+                    "target_ref": "slack:로이봉 이사님",
+                    "delivery_chat_id": "D_TARGET",
+                    "delivery_thread_id": None,
+                },
+            },
+        )
+
+        assert result.success is True
+        preview_kwargs = adapter_with_session_store._app.client.chat_postMessage.await_args.kwargs
+        assert preview_kwargs["channel"] == "C_ORIGIN"
+        assert preview_kwargs["thread_ts"] == "111.222"
+        assert preview_kwargs["blocks"][1]["elements"][0]["action_id"] == "hermes_owner_confirm_approve"
+        assert preview_kwargs["blocks"][1]["elements"][1]["action_id"] == "hermes_owner_confirm_cancel"
+        proposal_id = result.raw_response["proposal"]["proposal_id"]
+
+        await adapter_with_session_store._handle_owner_confirm_action(
+            AsyncMock(),
+            {
+                "message": {"ts": "preview_ts", "thread_ts": "111.222", "blocks": preview_kwargs["blocks"]},
+                "channel": {"id": "C_ORIGIN"},
+                "user": {"id": "U_OWNER", "name": "Cookie"},
+            },
+            {"action_id": "hermes_owner_confirm_approve", "value": proposal_id},
+        )
+
+        actual_kwargs = adapter_with_session_store._app.client.chat_postMessage.await_args_list[1].kwargs
+        assert actual_kwargs["channel"] == "D_TARGET"
+        assert actual_kwargs["text"] == "실제 전송될 본문"
+        assert "thread_ts" not in actual_kwargs
+        records = OwnerConfirmStore(audit_path).lookup(proposal_id)
+        assert records[-1]["execution_ref"] == "slack:D_TARGET:actual_ts"
+
+    @pytest.mark.asyncio
+    async def test_owner_confirm_cancel_button_rejects_without_execution(
+        self, adapter_with_session_store, mock_session_store, tmp_path
+    ):
+        """owner-confirm: cancel button records rejected and never executes the pending send."""
+        audit_path = tmp_path / "owner-confirm.jsonl"
+        adapter_with_session_store.config.extra["owner_confirm_audit_path"] = str(audit_path)
+        adapter_with_session_store._app.client.chat_postMessage = AsyncMock(return_value={"ts": "preview_ts"})
+        adapter_with_session_store._app.client.chat_update = AsyncMock(return_value={"ok": True})
+
+        result = await adapter_with_session_store.send(
+            "C123",
+            "취소되면 전송되면 안 됨",
+            metadata={
+                "thread_id": "123.000",
+                "owner_confirm": {
+                    "require": True,
+                    "owner": "U_OWNER",
+                    "actor": "U_BOT",
+                    "action_class": "send",
+                    "confirm_verb": "전송",
+                    "token": "CAFE",
+                },
+            },
+        )
+        proposal_id = result.raw_response["proposal"]["proposal_id"]
+        preview_blocks = adapter_with_session_store._app.client.chat_postMessage.await_args.kwargs["blocks"]
+
+        await adapter_with_session_store._handle_owner_confirm_action(
+            AsyncMock(),
+            {
+                "message": {"ts": "preview_ts", "thread_ts": "123.000", "blocks": preview_blocks},
+                "channel": {"id": "C123"},
+                "user": {"id": "U_OWNER", "name": "Cookie"},
+            },
+            {"action_id": "hermes_owner_confirm_cancel", "value": proposal_id},
+        )
+
+        assert adapter_with_session_store._app.client.chat_postMessage.await_count == 1
+        records = OwnerConfirmStore(audit_path).lookup(proposal_id)
+        assert [record["state"] for record in records] == ["proposed", "rejected"]
+        assert records[-1]["reject_reason"] == "USER_CANCELLED"
+        assert "실행 안 됨" in adapter_with_session_store._app.client.chat_update.await_args.kwargs["text"]
 
     @pytest.mark.asyncio
     async def test_prefetch_thread_context_before_ignoring_unowned_thread(

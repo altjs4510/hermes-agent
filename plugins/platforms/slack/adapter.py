@@ -14,7 +14,9 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Tuple, List
 
@@ -52,6 +54,12 @@ from gateway.platforms.base import (
     safe_url_for_log,
     cache_document_from_bytes,
     cache_video_from_bytes,
+)
+from gateway.owner_confirm import (
+    OwnerConfirmStore,
+    failure_response,
+    parse_confirm,
+    requires_owner_confirm,
 )
 
 
@@ -381,6 +389,11 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        # Owner-confirm executors keyed by proposal_id. This is intentionally
+        # an integration seam: parser/audit/idempotency lives in
+        # gateway.owner_confirm, while concrete side-effect dispatchers register
+        # callables here when they create a proposed action.
+        self._owner_confirm_executors: Dict[str, Any] = {}
 
     def _start_socket_mode_handler(self) -> None:
         """Start the Slack Socket Mode background task."""
@@ -1020,6 +1033,14 @@ class SlackAdapter(BasePlatformAdapter):
                     len(_plugin_handlers),
                 )
 
+            # Register owner-confirm buttons. These are the user-facing UX for
+            # proposed side effects; text approval remains a fallback/debug path.
+            for _action_id in (
+                "hermes_owner_confirm_approve",
+                "hermes_owner_confirm_cancel",
+            ):
+                self._app.action(_action_id)(self._handle_owner_confirm_action)
+
             # Bring up the handler and watchdog atomically. ``_running`` only
             # flips to True after the handler is alive so the watchdog loop
             # observes the live task immediately; on any failure here we tear
@@ -1131,6 +1152,151 @@ class SlackAdapter(BasePlatformAdapter):
             return self._team_clients[team_id]
         return self._app.client  # fallback to primary
 
+    async def _post_slack_message_chunks(
+        self,
+        *,
+        chat_id: str,
+        content: str,
+        thread_ts: Optional[str] = None,
+        broadcast: bool = False,
+    ) -> Dict[str, Any]:
+        formatted = self.format_message(content)
+        chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+        last_result: Dict[str, Any] = {}
+        for i, chunk in enumerate(chunks):
+            kwargs: Dict[str, Any] = {
+                "channel": chat_id,
+                "text": chunk,
+                "mrkdwn": True,
+            }
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+                if broadcast and i == 0:
+                    kwargs["reply_broadcast"] = True
+            last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+        return last_result
+
+    async def _send_owner_confirm_proposal(
+        self,
+        *,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str],
+        metadata: Dict[str, Any],
+        owner_confirm: Dict[str, Any],
+    ) -> SendResult:
+        action_class = str(owner_confirm.get("action_class") or "send")
+        if not requires_owner_confirm(action_class, side_effect=True):
+            return SendResult(success=False, error=f"owner_confirm not required for action_class={action_class}")
+
+        owner = str(owner_confirm.get("owner") or "").strip()
+        if not owner:
+            return SendResult(success=False, error="owner_confirm.owner is required")
+
+        thread_ts = self._resolve_thread_ts(reply_to, metadata)
+        delivery_chat_id = str(owner_confirm.get("delivery_chat_id") or chat_id)
+        delivery_thread_ts_raw = owner_confirm.get("delivery_thread_id", thread_ts)
+        delivery_thread_ts = str(delivery_thread_ts_raw) if delivery_thread_ts_raw else None
+        confirm_verb = str(owner_confirm.get("confirm_verb") or "전송")
+        token = str(owner_confirm.get("token") or secrets.token_hex(2).upper()).upper().lstrip("#")
+        actor = str(owner_confirm.get("actor") or self._bot_user_id or "slack-bot")
+        preview = content[:900] + "..." if len(content) > 900 else content
+        store = self._owner_confirm_store()
+        proposed = store.propose(
+            channel=chat_id,
+            thread_ts=str(thread_ts or ""),
+            actor=actor,
+            owner=owner,
+            action_class=action_class,
+            confirm_verb=confirm_verb,
+            token=token,
+            target_ref=str(owner_confirm.get("target_ref") or f"slack:{delivery_chat_id}:{delivery_thread_ts or 'root'}"),
+            preview_ref=str(owner_confirm.get("preview_ref") or "inline-preview"),
+            risk_level=str(owner_confirm.get("risk_level") or "low"),
+            side_effect=True,
+            token_ttl_sec=int(owner_confirm.get("token_ttl_sec") or 600),
+        )
+        proposal_id = str(proposed["proposal_id"])
+
+        async def _execute_send(_proposal: Dict[str, Any]) -> Dict[str, Any]:
+            result = await self._post_slack_message_chunks(
+                chat_id=delivery_chat_id,
+                content=content,
+                thread_ts=delivery_thread_ts,
+                broadcast=bool(self.config.extra.get("reply_broadcast", False)),
+            )
+            sent_ts = result.get("ts", "") if result else ""
+            if sent_ts:
+                self._bot_message_ts.add(sent_ts)
+                if thread_ts:
+                    self._bot_message_ts.add(thread_ts)
+            return {
+                "result": "success" if sent_ts else "failed",
+                "result_code": "OK" if sent_ts else "NO_TS",
+                "execution_ref": f"slack:{delivery_chat_id}:{sent_ts}" if sent_ts else None,
+            }
+
+        self._owner_confirm_executors[proposal_id] = _execute_send
+        preview_message = (
+            f"Owner-confirm preview: Slack 전송 대기\n"
+            f"proposal={proposal_id}\n"
+            f"owner=<@{owner}>\n"
+            f"승인 문구: `승인: {confirm_verb} #{token}`\n\n"
+            f"미리보기:\n{preview}"
+        )
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*Owner-confirm preview: Slack {confirm_verb} 대기*\n"
+                        f"owner: <@{owner}>\n"
+                        f"proposal: `{proposal_id}`\n\n"
+                        f"*미리보기*\n{preview}"
+                    ),
+                },
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": f"{confirm_verb} 승인"},
+                        "style": "primary",
+                        "action_id": "hermes_owner_confirm_approve",
+                        "value": proposal_id,
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "취소"},
+                        "style": "danger",
+                        "action_id": "hermes_owner_confirm_cancel",
+                        "value": proposal_id,
+                    },
+                ],
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"Fallback: `승인: {confirm_verb} #{token}`",
+                    }
+                ],
+            },
+        ]
+        kwargs: Dict[str, Any] = {
+            "channel": chat_id,
+            "text": preview_message,
+            "blocks": blocks,
+        }
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+        result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+        sent_ts = result.get("ts", "") if result else ""
+        return SendResult(success=True, message_id=sent_ts, raw_response={"proposal": proposed, "preview": result})
+
     async def send(
         self,
         chat_id: str,
@@ -1153,6 +1319,16 @@ class SlackAdapter(BasePlatformAdapter):
                 return await self._send_slash_ephemeral(
                     slash_ctx,
                     content,
+                )
+
+            owner_confirm = (metadata or {}).get("owner_confirm") if metadata else None
+            if isinstance(owner_confirm, dict) and owner_confirm.get("require"):
+                return await self._send_owner_confirm_proposal(
+                    chat_id=chat_id,
+                    content=content,
+                    reply_to=reply_to,
+                    metadata=metadata or {},
+                    owner_confirm=owner_confirm,
                 )
 
             # Convert standard markdown → Slack mrkdwn
@@ -2314,6 +2490,161 @@ class SlackAdapter(BasePlatformAdapter):
             fallback_event["thread_ts"] = thread_ts
         await self._handle_slack_message(fallback_event)
 
+    def _owner_confirm_store(self) -> OwnerConfirmStore:
+        path = self.config.extra.get("owner_confirm_audit_path") or os.getenv(
+            "HERMES_OWNER_CONFIRM_AUDIT_PATH"
+        )
+        if not path:
+            path = os.path.expanduser("~/.hermes/audit/owner-confirm.jsonl")
+        return OwnerConfirmStore(path)
+
+    @staticmethod
+    def _owner_confirm_is_expired(proposed: Dict[str, Any]) -> bool:
+        expires_at = str(proposed.get("expires_at") or "")
+        if not expires_at:
+            return False
+        try:
+            parsed = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        return datetime.now(timezone.utc) > parsed.astimezone(timezone.utc)
+
+    async def _send_owner_confirm_reply(self, channel_id: str, thread_ts: str, text: str) -> None:
+        await self._get_client(channel_id).chat_postMessage(
+            channel=channel_id,
+            text=text,
+            thread_ts=thread_ts,
+        )
+
+    async def _handle_owner_confirm_message(
+        self,
+        *,
+        text: str,
+        channel_id: str,
+        thread_ts: str,
+        message_ts: str,
+        user_id: str,
+    ) -> bool:
+        """Intercept owner-confirm approvals before normal agent routing.
+
+        Returns True when the message was an owner-confirm attempt and should
+        not enter the LLM/tool loop.
+        """
+        stripped = (text or "").strip()
+        if not stripped.startswith("승인"):
+            return False
+
+        parsed = parse_confirm(stripped)
+        if parsed is None:
+            await self._send_owner_confirm_reply(
+                channel_id,
+                thread_ts,
+                failure_response("FORMAT_MISMATCH"),
+            )
+            return True
+
+        store = self._owner_confirm_store()
+        proposed = store.latest_proposed(channel=channel_id, thread_ts=thread_ts)
+        if proposed is None:
+            await self._send_owner_confirm_reply(
+                channel_id,
+                thread_ts,
+                failure_response("TOKEN_MISMATCH"),
+            )
+            return True
+
+        proposal_id = str(proposed["proposal_id"])
+        reject_reason = ""
+        reject_detail = ""
+        if str(proposed.get("owner") or "") != str(user_id or ""):
+            reject_reason = "OWNER_MISMATCH"
+            reject_detail = "Approver does not match proposal owner."
+        elif str(proposed.get("confirm_verb") or "") != parsed.verb:
+            reject_reason = "VERB_MISMATCH"
+            reject_detail = "Approval verb does not match proposed action."
+        elif str(proposed.get("token") or "").upper() != parsed.token:
+            reject_reason = "TOKEN_MISMATCH"
+            reject_detail = "Approval token does not match latest proposal."
+        elif self._owner_confirm_is_expired(proposed):
+            reject_reason = "EXPIRED_TOKEN"
+            reject_detail = "Approval token is expired."
+
+        if reject_reason:
+            store.reject(
+                proposal_id=proposal_id,
+                actor=user_id,
+                reject_reason=reject_reason,
+                reject_detail=reject_detail,
+                confirm_message_ts=message_ts,
+            )
+            await self._send_owner_confirm_reply(
+                channel_id,
+                thread_ts,
+                failure_response(reject_reason),
+            )
+            return True
+
+        store.confirm(proposal_id=proposal_id, actor=user_id, confirm_message_ts=message_ts)
+        executor = self._owner_confirm_executors.get(proposal_id)
+        if executor is None:
+            executed = store.execute(
+                proposal_id=proposal_id,
+                actor=user_id,
+                result="failed",
+                result_code="NO_EXECUTOR",
+                error="No registered owner-confirm executor for proposal.",
+            )
+            await self._send_owner_confirm_reply(
+                channel_id,
+                thread_ts,
+                f"실행 실패: 승인 확인됨, 실행기 없음. proposal={proposal_id}",
+            )
+            return executed.get("state") == "executed"
+
+        try:
+            result = executor(proposed)
+            if asyncio.iscoroutine(result):
+                result = await result
+            result = result or {}
+            executed = store.execute(
+                proposal_id=proposal_id,
+                actor=user_id,
+                result=str(result.get("result") or "success"),
+                result_code=str(result.get("result_code") or "OK"),
+                execution_ref=result.get("execution_ref"),
+                error=result.get("error"),
+            )
+        except Exception as exc:  # pragma: no cover - defensive execution audit
+            executed = store.execute(
+                proposal_id=proposal_id,
+                actor=user_id,
+                result="failed",
+                result_code="EXECUTOR_ERROR",
+                error=str(exc),
+            )
+
+        if executed.get("state") == "rejected" and executed.get("reject_reason") == "ALREADY_EXECUTED":
+            await self._send_owner_confirm_reply(
+                channel_id,
+                thread_ts,
+                failure_response("ALREADY_EXECUTED"),
+            )
+            return True
+
+        if executed.get("status") == "completed":
+            await self._send_owner_confirm_reply(
+                channel_id,
+                thread_ts,
+                f"실행 완료: owner-confirm 승인 처리됨. proposal={proposal_id}",
+            )
+        else:
+            await self._send_owner_confirm_reply(
+                channel_id,
+                thread_ts,
+                f"실행 실패: owner-confirm 승인됐지만 실행 실패. proposal={proposal_id}",
+            )
+        return True
+
     async def _handle_slack_message(self, event: dict) -> None:
         """Handle an incoming Slack message event."""
         # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777)
@@ -2535,6 +2866,15 @@ class SlackAdapter(BasePlatformAdapter):
                 # so None here produces a non-threaded reply without
                 # further changes.
                 thread_ts = None
+
+        if await self._handle_owner_confirm_message(
+            text=original_text,
+            channel_id=channel_id,
+            thread_ts=str(thread_ts or ""),
+            message_ts=ts,
+            user_id=user_id,
+        ):
+            return
 
         # In channels, respond if:
         #   0. Channel is in free_response_channels, OR require_mention is
@@ -3292,6 +3632,113 @@ class SlackAdapter(BasePlatformAdapter):
                 exc,
                 exc_info=True,
             )
+
+    async def _handle_owner_confirm_action(self, ack, body, action) -> None:
+        """Handle owner-confirm approve/cancel buttons from Block Kit."""
+        await ack()
+
+        action_id = action.get("action_id", "")
+        proposal_id = action.get("value", "")
+        message = body.get("message", {})
+        msg_ts = message.get("ts", "")
+        channel_id = body.get("channel", {}).get("id", "")
+        user_name = body.get("user", {}).get("name", "unknown")
+        user_id = body.get("user", {}).get("id", "")
+
+        store = self._owner_confirm_store()
+        records = store.lookup(proposal_id)
+        proposed = next((record for record in reversed(records) if record.get("state") == "proposed"), None)
+        if not proposed:
+            logger.warning("[Slack] Owner-confirm button for unknown proposal: %s", proposal_id)
+            return
+
+        channel_id = channel_id or str(proposed.get("channel") or "")
+        thread_ts = str(proposed.get("thread_ts") or message.get("thread_ts") or msg_ts or "")
+
+        if action_id == "hermes_owner_confirm_cancel":
+            store.reject(
+                proposal_id=proposal_id,
+                actor=user_id,
+                reject_reason="USER_CANCELLED",
+                reject_detail="User cancelled owner-confirm proposal from Slack button.",
+                confirm_message_ts=msg_ts,
+            )
+            await self._update_owner_confirm_message(
+                channel_id=channel_id,
+                message_ts=msg_ts,
+                original_blocks=message.get("blocks", []),
+                decision_text=f"❌ 취소됨 by {user_name} — 실행 안 됨",
+            )
+            return
+
+        if action_id != "hermes_owner_confirm_approve":
+            logger.warning("[Slack] Unknown owner-confirm action_id: %s", action_id)
+            return
+
+        if str(proposed.get("owner") or "") != str(user_id or ""):
+            store.reject(
+                proposal_id=proposal_id,
+                actor=user_id,
+                reject_reason="OWNER_MISMATCH",
+                reject_detail="Approver does not match proposal owner.",
+                confirm_message_ts=msg_ts,
+            )
+            await self._update_owner_confirm_message(
+                channel_id=channel_id,
+                message_ts=msg_ts,
+                original_blocks=message.get("blocks", []),
+                decision_text=f"🚫 승인 권한 없음 by {user_name} — 실행 안 됨",
+            )
+            return
+
+        confirm_text = f"승인: {proposed.get('confirm_verb')} #{proposed.get('token')}"
+        handled = await self._handle_owner_confirm_message(
+            text=confirm_text,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            message_ts=msg_ts,
+            user_id=user_id,
+        )
+        if handled:
+            await self._update_owner_confirm_message(
+                channel_id=channel_id,
+                message_ts=msg_ts,
+                original_blocks=message.get("blocks", []),
+                decision_text=f"✅ 승인됨 by {user_name}",
+            )
+
+    async def _update_owner_confirm_message(
+        self,
+        *,
+        channel_id: str,
+        message_ts: str,
+        original_blocks: List[Dict[str, Any]],
+        decision_text: str,
+    ) -> None:
+        original_section = "Owner-confirm preview"
+        for block in original_blocks:
+            if block.get("type") == "section":
+                original_section = block.get("text", {}).get("text", original_section)
+                break
+        updated_blocks = [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": original_section},
+            },
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": decision_text}],
+            },
+        ]
+        try:
+            await self._get_client(channel_id).chat_update(
+                channel=channel_id,
+                ts=message_ts,
+                text=decision_text,
+                blocks=updated_blocks,
+            )
+        except Exception as exc:
+            logger.warning("[Slack] Failed to update owner-confirm message: %s", exc)
 
     async def _handle_approval_action(self, ack, body, action) -> None:
         """Handle an approval button click from Block Kit."""
