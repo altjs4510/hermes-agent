@@ -577,9 +577,12 @@ def _handle_send(args):
     send_thread_id = thread_id
     send_metadata = None
 
-    # Slack sends invoked from Slack are shared side effects. Show the Block Kit
-    # owner-confirm preview in the requester thread, then execute the resolved
-    # delivery target (channel/DM) only after button/text approval.
+    # Slack sends invoked from Slack are shared side effects. Route them through
+    # Hermes' native gateway approval UI (the same Allow Once/Session/Deny
+    # Block Kit flow used for dangerous command approvals), then perform the
+    # actual delivery only after approval.  Keep cookie.alter's target
+    # resolution, but do not use the alter-style owner-confirm/token gate as
+    # the primary UX.
     if platform_name == "slack":
         try:
             from gateway.session_context import get_session_env
@@ -587,27 +590,29 @@ def _handle_send(args):
             source_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
             owner_user_id = get_session_env("HERMES_SESSION_USER_ID", "")
             origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-            origin_thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "")
             if source_platform == "slack" and owner_user_id and origin_chat_id:
-                send_chat_id = origin_chat_id
-                send_thread_id = origin_thread_id or None
-                send_metadata = {
-                    "thread_id": send_thread_id,
-                    "owner_confirm": {
-                        "require": True,
-                        "owner": owner_user_id,
-                        "actor": owner_user_id,
-                        "action_class": "send",
-                        "confirm_verb": "전송",
-                        "target_ref": f"slack:{target_ref or chat_id}",
-                        "delivery_chat_id": chat_id,
-                        "delivery_thread_id": thread_id,
-                    },
-                }
-        except Exception:
-            send_chat_id = chat_id
-            send_thread_id = thread_id
-            send_metadata = None
+                from tools.approval import request_gateway_approval
+
+                preview = cleaned_message.strip() or _describe_media_for_mirror(media_files) or "(media only)"
+                if len(preview) > 1200:
+                    preview = preview[:1200] + "..."
+                approval = request_gateway_approval(
+                    command=(
+                        f"send_message platform=slack target={target_ref or chat_id} "
+                        f"thread={thread_id or '-'}\n\n{preview}"
+                    ),
+                    description="Slack message send requires approval",
+                    pattern_key="tool:send_message:slack",
+                    allow_permanent=False,
+                )
+                if not approval.get("approved"):
+                    return json.dumps({
+                        "success": False,
+                        "approval_required": True,
+                        "error": approval.get("message") or "Slack send was not approved.",
+                    })
+        except Exception as exc:
+            return json.dumps({"error": f"Slack send approval failed: {exc}"})
 
     try:
         from model_tools import _run_async
