@@ -1713,3 +1713,67 @@ class TestApprovalTimeoutIsNotConsent:
         assert last_post.get("choice") == "timeout", (
             f"hook choice should be 'timeout' on no-response, got {last_post.get('choice')!r}"
         )
+
+    def test_request_gateway_approval_uses_native_queue_and_resolves_once(self):
+        """Non-shell side effects should use the same native gateway approval queue."""
+        from tools import approval as mod
+
+        notified = []
+        mod.register_gateway_notify(self.SESSION_KEY, lambda data: notified.append(data))
+
+        result_holder = {}
+        def _request():
+            result_holder["r"] = mod.request_gateway_approval(
+                command="send_message platform=slack target=U123\n\nhello",
+                description="Slack message send requires approval",
+                pattern_key="tool:send_message:slack",
+                allow_permanent=False,
+            )
+
+        t = threading.Thread(target=_request)
+        t.start()
+        for _ in range(50):
+            if mod._gateway_queues.get(self.SESSION_KEY):
+                break
+            time.sleep(0.02)
+        mod.resolve_gateway_approval(self.SESSION_KEY, "once")
+        t.join(timeout=5)
+
+        assert "r" in result_holder, "side-effect approval wait did not return"
+        assert result_holder["r"]["approved"] is True
+        assert result_holder["r"]["choice"] == "once"
+        assert notified == [
+            {
+                "command": "send_message platform=slack target=U123\n\nhello",
+                "pattern_key": "tool:send_message:slack",
+                "pattern_keys": ["tool:send_message:slack"],
+                "description": "Slack message send requires approval",
+                "allow_permanent": False,
+            }
+        ]
+
+    def test_request_gateway_approval_downgrades_always_when_permanent_disabled(self):
+        from tools import approval as mod
+
+        mod.register_gateway_notify(self.SESSION_KEY, lambda data: None)
+
+        result_holder = {}
+        def _request():
+            result_holder["r"] = mod.request_gateway_approval(
+                command="send_message platform=slack target=U123\n\nhello",
+                description="Slack message send requires approval",
+                pattern_key="tool:send_message:slack",
+                allow_permanent=False,
+            )
+
+        t = threading.Thread(target=_request)
+        t.start()
+        for _ in range(50):
+            if mod._gateway_queues.get(self.SESSION_KEY):
+                break
+            time.sleep(0.02)
+        mod.resolve_gateway_approval(self.SESSION_KEY, "always")
+        t.join(timeout=5)
+
+        assert result_holder["r"]["approved"] is True
+        assert result_holder["r"]["choice"] == "session"

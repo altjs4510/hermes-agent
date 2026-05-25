@@ -479,7 +479,7 @@ class TestSendMessageTool:
             force_document=False,
         )
 
-    def test_slack_session_person_name_creates_owner_confirm_preview_for_dm(self):
+    def test_slack_session_person_name_uses_native_approval_then_sends_dm(self):
         slack_cfg = SimpleNamespace(enabled=True, token="xoxb-test", extra={})
         config = SimpleNamespace(
             platforms={Platform.SLACK: slack_cfg},
@@ -501,6 +501,7 @@ class TestSendMessageTool:
              patch("model_tools._run_async", side_effect=_run_async_immediately), \
              patch("tools.send_message_tool._resolve_slack_user_id_via_api", new=AsyncMock(return_value=("U987654321", None))) as resolve_mock, \
              patch("tools.send_message_tool._open_slack_dm_channel", new=AsyncMock(return_value="D987DMCHAN")) as open_dm_mock, \
+             patch("tools.approval.request_gateway_approval", return_value={"approved": True, "choice": "once"}) as approval_mock, \
              patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
              patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
             result = json.loads(
@@ -514,23 +515,26 @@ class TestSendMessageTool:
             )
 
         assert result["success"] is True
-        assert result["owner_confirm_required"] is True
         resolve_mock.assert_awaited_once_with("xoxb-test", "로이봉 이사님")
         open_dm_mock.assert_awaited_once_with("xoxb-test", "U987654321")
-        send_mock.assert_awaited_once()
-        call = send_mock.await_args
-        assert call.args[:4] == (Platform.SLACK, slack_cfg, "C_ORIGIN", "hello")
-        assert call.kwargs["thread_id"] == "111.222"
-        assert call.kwargs["metadata"]["thread_id"] == "111.222"
-        owner_confirm = call.kwargs["metadata"]["owner_confirm"]
-        assert owner_confirm["require"] is True
-        assert owner_confirm["owner"] == "U_OWNER"
-        assert owner_confirm["delivery_chat_id"] == "D987DMCHAN"
-        assert owner_confirm["delivery_thread_id"] is None
-        assert owner_confirm["target_ref"] == "slack:로이봉 이사님"
-        mirror_mock.assert_not_called()
+        approval_mock.assert_called_once()
+        approval_kwargs = approval_mock.call_args.kwargs
+        assert approval_kwargs["pattern_key"] == "tool:send_message:slack"
+        assert approval_kwargs["allow_permanent"] is False
+        assert "target=로이봉 이사님" in approval_kwargs["command"]
+        assert "hello" in approval_kwargs["command"]
+        send_mock.assert_awaited_once_with(
+            Platform.SLACK,
+            slack_cfg,
+            "D987DMCHAN",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+        )
+        mirror_mock.assert_called_once()
 
-    def test_slack_session_mention_target_creates_owner_confirm_preview_for_dm(self):
+    def test_slack_session_mention_target_uses_native_approval_then_sends_dm(self):
         slack_cfg = SimpleNamespace(enabled=True, token="xoxb-test", extra={})
         config = SimpleNamespace(
             platforms={Platform.SLACK: slack_cfg},
@@ -551,6 +555,7 @@ class TestSendMessageTool:
              patch("gateway.session_context.get_session_env", side_effect=_session_env), \
              patch("model_tools._run_async", side_effect=_run_async_immediately), \
              patch("tools.send_message_tool._open_slack_dm_channel", new=AsyncMock(return_value="D123DMCHAN")) as open_dm_mock, \
+             patch("tools.approval.request_gateway_approval", return_value={"approved": True, "choice": "once"}) as approval_mock, \
              patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
              patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
             result = json.loads(
@@ -564,12 +569,61 @@ class TestSendMessageTool:
             )
 
         assert result["success"] is True
-        assert result["owner_confirm_required"] is True
         open_dm_mock.assert_awaited_once_with("xoxb-test", "U123456789")
-        call = send_mock.await_args
-        assert call.args[:4] == (Platform.SLACK, slack_cfg, "C_ORIGIN", "hello")
-        assert call.kwargs["metadata"]["owner_confirm"]["delivery_chat_id"] == "D123DMCHAN"
-        assert call.kwargs["metadata"]["owner_confirm"]["target_ref"] == "slack:<@U123456789>"
+        approval_mock.assert_called_once()
+        approval_kwargs = approval_mock.call_args.kwargs
+        assert approval_kwargs["allow_permanent"] is False
+        assert "target=<@U123456789>" in approval_kwargs["command"]
+        send_mock.assert_awaited_once_with(
+            Platform.SLACK,
+            slack_cfg,
+            "D123DMCHAN",
+            "hello",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+        )
+        mirror_mock.assert_called_once()
+
+    def test_slack_session_send_stops_when_native_approval_denied(self):
+        slack_cfg = SimpleNamespace(enabled=True, token="xoxb-test", extra={})
+        config = SimpleNamespace(
+            platforms={Platform.SLACK: slack_cfg},
+            get_home_channel=lambda _platform: None,
+        )
+
+        def _session_env(name, default=""):
+            return {
+                "HERMES_SESSION_PLATFORM": "slack",
+                "HERMES_SESSION_USER_ID": "U_OWNER",
+                "HERMES_SESSION_CHAT_ID": "C_ORIGIN",
+                "HERMES_SESSION_THREAD_ID": "111.222",
+            }.get(name, default)
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.channel_directory.resolve_channel_name", return_value=None), \
+             patch("gateway.session_context.get_session_env", side_effect=_session_env), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._open_slack_dm_channel", new=AsyncMock(return_value="D123DMCHAN")), \
+             patch("tools.approval.request_gateway_approval", return_value={"approved": False, "message": "BLOCKED: denied"}) as approval_mock, \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "slack:<@U123456789>",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is False
+        assert result["approval_required"] is True
+        assert "denied" in result["error"]
+        approval_mock.assert_called_once()
+        send_mock.assert_not_awaited()
         mirror_mock.assert_not_called()
 
     def test_slack_person_name_normalization_strips_honorifics(self):

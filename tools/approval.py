@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 import unicodedata
-from typing import Optional
+from typing import Any, Callable, Optional, cast
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
@@ -759,6 +759,170 @@ def has_blocking_approval(session_key: str) -> bool:
     """Check if a session has one or more blocking gateway approvals waiting."""
     with _lock:
         return bool(_gateway_queues.get(session_key))
+
+
+def request_gateway_approval(
+    *,
+    command: str,
+    description: str,
+    pattern_key: str,
+    pattern_keys: Optional[list[str]] = None,
+    allow_permanent: bool = False,
+    timeout: Optional[int] = None,
+) -> dict:
+    """Request approval through the existing gateway approval UI.
+
+    This is the side-effect/tool analogue of ``check_all_command_guards``:
+    it uses the same per-session queue, Slack/Discord/etc. button UI, text
+    fallback, timeout contract, and ``resolve_gateway_approval`` path, but the
+    caller supplies the risk description instead of relying on shell-command
+    pattern detection.  Use it for non-shell shared side effects such as
+    sending a Slack DM from a Slack-originated session.
+    """
+    approval_mode = _get_approval_mode()
+    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+        return {"approved": True, "message": None}
+
+    if not (_is_gateway_approval_context() or env_var_enabled("HERMES_EXEC_ASK")):
+        return {"approved": True, "message": None}
+
+    session_key = get_current_session_key()
+    keys = list(pattern_keys or [pattern_key])
+    notify_cb: Optional[Callable[[dict[str, Any]], None]] = None
+    with _lock:
+        candidate = _gateway_notify_cbs.get(session_key)
+        if callable(candidate):
+            notify_cb = cast(Callable[[dict[str, Any]], None], candidate)
+
+    if notify_cb is None:
+        return {
+            "approved": False,
+            "status": "pending_approval",
+            "approval_pending": True,
+            "command": command,
+            "description": description,
+            "message": (
+                f"⚠️ {description}. Asking the user for approval.\n\n"
+                f"**Action:**\n```\n{command}\n```"
+            ),
+        }
+
+    approval_data = {
+        "command": command,
+        "pattern_key": pattern_key,
+        "pattern_keys": keys,
+        "description": description,
+        "allow_permanent": allow_permanent,
+    }
+    entry = _ApprovalEntry(approval_data)
+    with _lock:
+        _gateway_queues.setdefault(session_key, []).append(entry)
+
+    _fire_approval_hook(
+        "pre_approval_request",
+        command=command,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=list(keys),
+        session_key=session_key,
+        surface="gateway",
+    )
+
+    try:
+        notify_cb(approval_data)
+    except Exception as exc:
+        logger.warning("Gateway approval notify failed: %s", exc)
+        with _lock:
+            queue = _gateway_queues.get(session_key, [])
+            if entry in queue:
+                queue.remove(entry)
+            if not queue:
+                _gateway_queues.pop(session_key, None)
+        return {
+            "approved": False,
+            "message": "BLOCKED: Failed to send approval request to user. Do NOT retry.",
+            "pattern_key": pattern_key,
+            "description": description,
+        }
+
+    if timeout is None:
+        raw_timeout = _get_approval_config().get("gateway_timeout", 300)
+    else:
+        raw_timeout = timeout
+    try:
+        timeout = int(raw_timeout)
+    except (ValueError, TypeError):
+        timeout = 300
+
+    try:
+        from tools.environments.base import touch_activity_if_due
+    except Exception:  # pragma: no cover
+        touch_activity_if_due = None
+
+    _now = time.monotonic()
+    _deadline = _now + max(timeout, 0)
+    _activity_state = {"last_touch": _now, "start": _now}
+    resolved = False
+    while True:
+        _remaining = _deadline - time.monotonic()
+        if _remaining <= 0:
+            break
+        if entry.event.wait(timeout=min(1.0, _remaining)):
+            resolved = True
+            break
+        if touch_activity_if_due is not None:
+            touch_activity_if_due(_activity_state, "waiting for user approval")
+
+    with _lock:
+        queue = _gateway_queues.get(session_key, [])
+        if entry in queue:
+            queue.remove(entry)
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+
+    choice = entry.result
+    if choice == "always" and not allow_permanent:
+        # Keep the native UI contract safe for shared side effects: a broad
+        # permanent allow button should not make future external writes silent
+        # unless the caller explicitly opted into that semantics.
+        choice = "session"
+
+    _outcome = "timeout" if not resolved else (choice if choice else "timeout")
+    _fire_approval_hook(
+        "post_approval_response",
+        command=command,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=list(keys),
+        session_key=session_key,
+        surface="gateway",
+        choice=_outcome,
+    )
+
+    if not resolved or choice is None or choice == "deny":
+        reason = "timed out without user response" if not resolved else "denied by user"
+        timeout_addendum = " Silence is not consent." if not resolved else ""
+        return {
+            "approved": False,
+            "message": (
+                f"BLOCKED: Action {reason}. The user has NOT consented "
+                f"to this shared side effect. Do NOT retry, rephrase, or "
+                f"attempt the same outcome through a different tool."
+                f"{timeout_addendum}"
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+            "outcome": "timeout" if not resolved else "denied",
+            "user_consent": False,
+        }
+
+    return {
+        "approved": True,
+        "message": None,
+        "user_approved": True,
+        "description": description,
+        "choice": choice,
+    }
 
 
 def submit_pending(session_key: str, approval: dict):

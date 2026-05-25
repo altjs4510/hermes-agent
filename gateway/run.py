@@ -15791,14 +15791,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # false positives from MagicMock auto-attribute creation in tests.
                 if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
                     try:
+                        approval_kwargs = {
+                            "chat_id": _status_chat_id,
+                            "command": cmd,
+                            "session_key": _approval_session_key,
+                            "description": desc,
+                            "metadata": _status_thread_metadata,
+                        }
+                        send_exec_approval = getattr(_status_adapter, "send_exec_approval")
+                        try:
+                            import inspect as _inspect
+                            if "allow_permanent" in _inspect.signature(send_exec_approval).parameters:
+                                approval_kwargs["allow_permanent"] = bool(approval_data.get("allow_permanent", True))
+                        except Exception:
+                            pass
                         _approval_fut = safe_schedule_threadsafe(
-                            _status_adapter.send_exec_approval(
-                                chat_id=_status_chat_id,
-                                command=cmd,
-                                session_key=_approval_session_key,
-                                description=desc,
-                                metadata=_status_thread_metadata,
-                            ),
+                            send_exec_approval(**approval_kwargs),
                             _loop_for_step,
                             logger=logger,
                             log_message="send_exec_approval scheduling error",
