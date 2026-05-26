@@ -19,6 +19,7 @@ import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Tuple, List
+from urllib.parse import parse_qs, urlparse
 
 try:
     from slack_bolt.async_app import AsyncApp
@@ -64,6 +65,10 @@ from gateway.owner_confirm import (
 
 
 logger = logging.getLogger(__name__)
+
+_SLACK_PERMALINK_RE = re.compile(
+    r"https://[^\s<>|]+/archives/(?P<channel>[A-Z0-9]+)/p(?P<digits>\d{16})(?:\?[^\s<>|]*)?"
+)
 
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
@@ -276,6 +281,87 @@ def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> st
         payload = payload[: max_chars - 18].rstrip() + "\n... [truncated]"
 
     return f"[Slack Block Kit payload for this message]\n```json\n{payload}\n```"
+
+
+def _render_slack_attachments_for_agent(attachments: list, max_chars: int = 4000) -> str:
+    """Render Slack unfurls/shared-message attachments into agent-visible text.
+
+    Slack message shares arrive as ``attachments`` with ``is_msg_unfurl`` and
+    the quoted/shared message body in ``text``/``fallback`` and sometimes nested
+    ``message_blocks``.  Those are exactly the "아래 내용" Cookie expects the
+    alter to see, so do not drop them merely because they are message unfurls.
+    """
+    if not attachments:
+        return ""
+
+    parts: list[str] = []
+    for att in attachments:
+        att_title = att.get("title", "")
+        att_url = att.get("title_link", "") or att.get("from_url", "")
+        att_text = att.get("text", "")
+        att_footer = att.get("footer", "")
+        att_fallback = att.get("fallback", "")
+        author_name = att.get("author_name", "") or att.get("author_subname", "")
+
+        nested_blocks_texts: list[str] = []
+        for item in att.get("message_blocks") or []:
+            message = item.get("message") if isinstance(item, dict) else None
+            blocks = (message or {}).get("blocks") if isinstance(message, dict) else None
+            block_text = _extract_text_from_slack_blocks(blocks or [])
+            if block_text:
+                nested_blocks_texts.append(block_text.strip())
+
+        if att_title and att_url:
+            header = f"📎 [{att_title}]({att_url})"
+        elif att_title:
+            header = f"📎 {att_title}"
+        elif att_url:
+            header = f"📎 {att_url}"
+        elif author_name:
+            header = f"📎 Slack shared message from {author_name}"
+        else:
+            header = "📎 Slack attachment"
+
+        body = att_text or "\n\n".join(nested_blocks_texts) or att_fallback or ""
+        body = body.strip()
+        if len(body) > max_chars:
+            body = body[: max_chars - 18].rstrip() + "\n... [truncated]"
+
+        section = header
+        if author_name and author_name not in section:
+            section += f"\n   from: {author_name}"
+        if body:
+            section += f"\n   {body}"
+        if att_footer:
+            section += f"\n   _{att_footer}_"
+
+        parts.append(section)
+
+    return "\n\n".join(parts)
+
+
+def _extract_text_from_slack_message(message: dict, *, include_blocks_payload: bool = False) -> str:
+    """Return Slack message text plus block/attachment content visible to users."""
+    text = (message.get("text") or "").strip()
+
+    blocks = message.get("blocks") or []
+    if blocks:
+        blocks_text = _extract_text_from_slack_blocks(blocks)
+        if blocks_text:
+            stripped_blocks = blocks_text.strip()
+            if stripped_blocks and stripped_blocks not in text:
+                text = (text + "\n" + stripped_blocks).strip()
+
+        if include_blocks_payload:
+            blocks_payload = _serialize_slack_blocks_for_agent(blocks)
+            if blocks_payload:
+                text = (text + "\n\n" + blocks_payload).strip()
+
+    attachment_text = _render_slack_attachments_for_agent(message.get("attachments") or [])
+    if attachment_text and attachment_text not in text:
+        text = (text + "\n\n" + attachment_text).strip()
+
+    return text
 
 
 def _apply_slack_proxy(client: Any, proxy_url: Optional[str]) -> None:
@@ -2821,6 +2907,7 @@ class SlackAdapter(BasePlatformAdapter):
             return
 
         original_text = event.get("text", "")
+        raw_original_text = original_text
 
         # Slack blocks native slash commands inside threads ("/queue is not
         # supported in threads. Sorry!").  As a workaround, recognise a
@@ -2846,96 +2933,11 @@ class SlackAdapter(BasePlatformAdapter):
             except Exception:  # pragma: no cover - defensive
                 pass
 
-        text = original_text
-
-        # Extract quoted/forwarded content from Slack blocks.
-        # Slack's modern composer embeds forwarded messages in the ``blocks``
-        # array as ``rich_text_quote`` elements, which are NOT reflected in
-        # the plain ``text`` field.  Merge block text so the agent sees the
-        # full message content.
-        blocks = event.get("blocks")
-        if blocks:
-            blocks_text = _extract_text_from_slack_blocks(blocks)
-            if blocks_text:
-                # Only append if the blocks contain text not already present
-                # in the plain text field (avoids duplication).
-                stripped_blocks = blocks_text.strip()
-                if stripped_blocks and stripped_blocks not in text.strip():
-                    logger.debug(
-                        "Slack: extracted additional text from blocks "
-                        "(likely quoted/forwarded content): %s",
-                        stripped_blocks[:300],
-                    )
-                    text = (text.strip() + "\n" + stripped_blocks).strip()
-
-            blocks_payload = _serialize_slack_blocks_for_agent(blocks)
-            if blocks_payload:
-                text = (text.strip() + "\n\n" + blocks_payload).strip()
-
-        # Extract link unfurls / rich attachments (e.g. Notion previews).
-        # Slack places unfurled link previews in the ``attachments`` array with
-        # fields like title, title_link/from_url, text, footer, and fallback.
-        # Without reading these, the agent never sees shared link previews.
-        slack_attachments = event.get("attachments") or []
-        if slack_attachments:
-            att_parts: list[str] = []
-            for att in slack_attachments:
-                att_title = att.get("title", "")
-                att_url = att.get("title_link", "") or att.get("from_url", "")
-                att_text = att.get("text", "")
-                att_footer = att.get("footer", "")
-                att_fallback = att.get("fallback", "")
-
-                # Skip message-type attachments (e.g. Slack bot messages with
-                # is_msg_unfurl) to avoid echoing our own content.
-                if att.get("is_msg_unfurl"):
-                    continue
-
-                # Build a readable representation.
-                if att_title and att_url:
-                    header = f"📎 [{att_title}]({att_url})"
-                elif att_title:
-                    header = f"📎 {att_title}"
-                elif att_url:
-                    header = f"📎 {att_url}"
-                else:
-                    header = None
-
-                # Prefer preview text, fall back to fallback description.
-                body = att_text or att_fallback or ""
-                if body:
-                    body = body.strip()
-                    if len(body) > 500:
-                        body = body[:497] + "..."
-
-                if header and body:
-                    section = f"{header}\n   {body}"
-                elif header:
-                    section = header
-                elif body:
-                    section = f"📎 {body}"
-                else:
-                    continue
-
-                # Deduplicate only when the fully rendered section is already
-                # present. The shared URL often already appears in the user's
-                # message text, and skipping on URL/title alone would hide the
-                # preview body we actually want the agent to see.
-                if section in text:
-                    continue
-
-                if att_footer:
-                    section = f"{section}\n   _{att_footer}_"
-
-                att_parts.append(section)
-
-            if att_parts:
-                attachment_text = "\n\n".join(att_parts)
-                text = (text.strip() + "\n\n" + attachment_text).strip()
-                logger.debug(
-                    "Slack: appended %d link unfurl(s) to message text",
-                    len(att_parts),
-                )
+        text = _extract_text_from_slack_message(event, include_blocks_payload=True)
+        if raw_original_text.startswith("!") and original_text.startswith("/") and text.startswith("!"):
+            text = original_text + text[len(raw_original_text):]
+        if text != original_text:
+            logger.debug("Slack: expanded message text from blocks/attachments")
 
         channel_id = event.get("channel", "")
         ts = event.get("ts", "")
@@ -3051,7 +3053,7 @@ class SlackAdapter(BasePlatformAdapter):
                 team_id=team_id,
             )
 
-        if not is_dm and bot_uid:
+        if not is_dm:
             # Check allowed channels — if set, only respond in these channels (whitelist)
             allowed_channels = self._slack_allowed_channels()
             if allowed_channels and channel_id not in allowed_channels:
@@ -3064,6 +3066,17 @@ class SlackAdapter(BasePlatformAdapter):
                 pass  # Free-response channel — always process
             elif not self._slack_require_mention():
                 pass  # Mention requirement disabled globally for Slack
+            elif not bot_uid:
+                # Fail closed when mention-gating is enabled but auth/team metadata
+                # has not resolved our bot user ID.  Otherwise every channel
+                # message falls through as if it were meant for Hermes.
+                logger.warning(
+                    "[Slack] Ignoring channel message because bot user ID is unknown "
+                    "while require_mention=true (channel=%s team=%s)",
+                    channel_id,
+                    team_id,
+                )
+                return
             elif self._slack_strict_mention() and not is_mentioned:
                 return  # Strict mode: ignore until @-mentioned again
             elif not is_mentioned:
@@ -3122,6 +3135,14 @@ class SlackAdapter(BasePlatformAdapter):
                     ]
                     for t in to_remove:
                         self._mentioned_threads.discard(t)
+
+        linked_context = await self._fetch_linked_slack_message_context(
+            text,
+            current_channel_id=channel_id,
+            team_id=team_id,
+        )
+        if linked_context:
+            text = (text.strip() + "\n\n" + linked_context).strip()
 
         # When entering a thread for the first time (no existing session),
         # fetch thread context so the agent understands the conversation.
@@ -4082,6 +4103,97 @@ class SlackAdapter(BasePlatformAdapter):
 
     # ----- Thread context fetching -----
 
+    def _parse_slack_permalink(self, url_text: str) -> Optional[Tuple[str, str, Optional[str]]]:
+        """Parse a Slack message permalink into (channel_id, message_ts, thread_ts)."""
+        match = _SLACK_PERMALINK_RE.search(url_text or "")
+        if not match:
+            return None
+        digits = match.group("digits")
+        message_ts = f"{digits[:10]}.{digits[10:]}"
+        parsed_url = urlparse(match.group(0).replace("&amp;", "&"))
+        query = parse_qs(parsed_url.query)
+        thread_ts = (query.get("thread_ts") or [None])[0]
+        return match.group("channel"), message_ts, thread_ts
+
+    async def _fetch_linked_slack_message_context(
+        self,
+        text: str,
+        *,
+        current_channel_id: str = "",
+        team_id: str = "",
+        max_links: int = 5,
+    ) -> str:
+        """Fetch Slack messages explicitly linked from the current text.
+
+        Slack unfurls often include only a preview/title.  Cookie.alter parity
+        requires Hermes to read the actual linked Slack message body before the
+        agent reasons over a request like "아래 링크 본문 보고 처리해".
+        """
+        if not text or not self._app:
+            return ""
+
+        seen: set[Tuple[str, str]] = set()
+        parts: List[str] = []
+        for match in _SLACK_PERMALINK_RE.finditer(text):
+            parsed = self._parse_slack_permalink(match.group(0))
+            if not parsed:
+                continue
+            channel_id, message_ts, thread_ts = parsed
+            message_key = (channel_id, message_ts)
+            if message_key in seen:
+                continue
+            seen.add(message_key)
+            if len(parts) >= max_links:
+                break
+            try:
+                client = self._get_client(current_channel_id or channel_id)
+                result = await client.conversations_history(
+                    channel=channel_id,
+                    latest=message_ts,
+                    inclusive=True,
+                    limit=1,
+                )
+                messages = result.get("messages", []) if result else []
+                msg = messages[0] if messages and messages[0].get("ts") == message_ts else None
+                if msg is None:
+                    # Thread-reply permalinks carry ?thread_ts=<root>.  Channel history
+                    # generally cannot see non-broadcast replies, so use the root ts
+                    # to fetch replies and select the exact linked reply.
+                    result = await client.conversations_replies(
+                        channel=channel_id,
+                        ts=thread_ts or message_ts,
+                        latest=message_ts,
+                        inclusive=True,
+                        limit=50 if thread_ts else 1,
+                    )
+                    reply_messages = result.get("messages", []) if result else []
+                    msg = next((item for item in reply_messages if item.get("ts") == message_ts), None)
+                if msg is None:
+                    continue
+                msg_text = _extract_text_from_slack_message(msg)
+                if not msg_text:
+                    continue
+                bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+                if bot_uid:
+                    msg_text = msg_text.replace(f"<@{bot_uid}>", "").strip()
+                msg_user = msg.get("user") or msg.get("username") or "unknown"
+                display_name = await self._resolve_user_name(str(msg_user), chat_id=channel_id)
+                parts.append(f"{channel_id}/{message_ts} {display_name}: {msg_text}")
+            except Exception as exc:
+                logger.warning(
+                    "[Slack] Failed to fetch linked Slack message %s: %s",
+                    safe_url_for_log(match.group(0)),
+                    exc,
+                )
+
+        if not parts:
+            return ""
+        return (
+            "[Linked Slack message context — messages explicitly linked in the current request:]\n"
+            + "\n".join(parts)
+            + "\n[End of linked Slack message context]"
+        )
+
     async def _fetch_thread_context(
         self,
         channel_id: str,
@@ -4187,13 +4299,22 @@ class SlackAdapter(BasePlatformAdapter):
                 ):
                     continue
 
-                msg_text = msg.get("text", "").strip()
+                msg_text = _extract_text_from_slack_message(msg)
                 if not msg_text:
                     continue
 
                 # Strip bot mentions from context messages
                 if bot_uid:
                     msg_text = msg_text.replace(f"<@{bot_uid}>", "").strip()
+
+                linked_context = await self._fetch_linked_slack_message_context(
+                    msg_text,
+                    current_channel_id=channel_id,
+                    team_id=team_id,
+                    max_links=3,
+                )
+                if linked_context:
+                    msg_text = (msg_text + "\n" + linked_context).strip()
 
                 prefix = "[thread parent] " if is_parent else ""
                 display_user = msg_user or "unknown"
@@ -4262,7 +4383,7 @@ class SlackAdapter(BasePlatformAdapter):
             if parent.get("ts", "") != thread_ts:
                 return ""
             bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
-            text = (parent.get("text") or "").strip()
+            text = _extract_text_from_slack_message(parent)
             if bot_uid:
                 text = text.replace(f"<@{bot_uid}>", "").strip()
             return text

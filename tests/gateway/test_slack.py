@@ -1666,15 +1666,15 @@ class TestIncomingDocumentHandling:
         assert "_Notion_" in msg_event.text
 
     @pytest.mark.asyncio
-    async def test_message_unfurl_attachments_are_skipped(self, adapter):
-        """Message unfurls should be skipped to avoid echoing Slack message copies."""
+    async def test_message_unfurl_attachments_are_visible_to_agent(self, adapter):
+        """Message unfurls are useful quoted context and should be visible."""
         event = self._make_event(
             text="https://example.com/thread",
             attachments=[
                 {
                     "is_msg_unfurl": True,
                     "title": "Thread copy",
-                    "text": "This should not be appended",
+                    "text": "This should be appended",
                 }
             ],
         )
@@ -1682,7 +1682,9 @@ class TestIncomingDocumentHandling:
         await adapter._handle_slack_message(event)
 
         msg_event = adapter.handle_message.call_args[0][0]
-        assert msg_event.text == "https://example.com/thread"
+        assert "https://example.com/thread" in msg_event.text
+        assert "📎 Thread copy" in msg_event.text
+        assert "This should be appended" in msg_event.text
 
     @pytest.mark.asyncio
     async def test_channel_routing_ignores_bot_mentions_inside_block_text(
@@ -2820,6 +2822,189 @@ class TestThreadReplyHandling:
         }
         await adapter_with_session_store._handle_slack_message(event)
         adapter_with_session_store.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_channel_message_fails_closed_when_bot_user_id_unknown(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """Mention-gated channel routing must not answer everything if bot UID is missing."""
+        adapter_with_session_store._bot_user_id = None
+        adapter_with_session_store._team_bot_user_ids = {}
+        adapter_with_session_store.config.extra["require_mention"] = True
+        mock_session_store._entries = {}
+
+        event = {
+            "text": "안녕 너 누구야",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_permalink_is_not_fetched_for_unrouted_channel_message(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """Ignored channel messages must not fetch linked Slack bodies before routing passes."""
+        adapter_with_session_store._app.client.conversations_history = AsyncMock(return_value={
+            "messages": [{"text": "should not be fetched", "user": "U_LINKED", "ts": "1779747784.534769"}]
+        })
+        mock_session_store._entries = {}
+        event = {
+            "text": "그냥 공유 https://fnf.slack.com/archives/C999/p1779747784534769",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_not_called()
+        adapter_with_session_store._app.client.conversations_history.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_permalink_is_not_fetched_outside_allowed_channels(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """Allowed-channel filtering must run before linked-message fetches."""
+        adapter_with_session_store.config.extra["allowed_channels"] = "C_ALLOWED"
+        adapter_with_session_store._app.client.conversations_history = AsyncMock(return_value={
+            "messages": [{"text": "should not be fetched", "user": "U_LINKED", "ts": "1779747784.534769"}]
+        })
+        event = {
+            "text": "<@U_BOT> 봐줘 https://fnf.slack.com/archives/C999/p1779747784534769",
+            "user": "U_USER",
+            "channel": "C_BLOCKED",
+            "ts": "123.456",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_not_called()
+        adapter_with_session_store._app.client.conversations_history.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_linked_slack_message_context_is_appended_before_dispatch(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """Slack permalinks in a request are fetched as message body context."""
+        adapter_with_session_store._app.client.conversations_history = AsyncMock(return_value={
+            "messages": [
+                {"text": "링크된 원문 내용", "user": "U_LINKED", "ts": "1779747784.534769"}
+            ]
+        })
+        adapter_with_session_store._app.client.users_info = AsyncMock(return_value={
+            "user": {"profile": {"display_name": "Linked User"}}
+        })
+        event = {
+            "text": "<@U_BOT> 이 링크 본문 보고 처리해 https://fnf.slack.com/archives/C999/p1779747784534769",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_called_once()
+        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
+        assert "[Linked Slack message context" in msg_event.text
+        assert "C999/1779747784.534769" in msg_event.text
+        assert "링크된 원문 내용" in msg_event.text
+        adapter_with_session_store._app.client.conversations_history.assert_awaited_once_with(
+            channel="C999", latest="1779747784.534769", inclusive=True, limit=1
+        )
+
+    @pytest.mark.asyncio
+    async def test_linked_slack_thread_reply_permalink_uses_thread_root_ts(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """Permalinks to thread replies are fetched via the root thread_ts query param."""
+        adapter_with_session_store._app.client.conversations_history = AsyncMock(return_value={
+            "messages": [{"text": "root not the reply", "user": "U_ROOT", "ts": "1779747000.000000"}]
+        })
+        adapter_with_session_store._app.client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"text": "thread root", "user": "U_ROOT", "ts": "1779747000.000000"},
+                {"text": "링크된 댓글 본문", "user": "U_LINKED", "ts": "1779747784.534769"},
+            ]
+        })
+        adapter_with_session_store._app.client.users_info = AsyncMock(return_value={
+            "user": {"profile": {"display_name": "Reply User"}}
+        })
+        event = {
+            "text": "<@U_BOT> 이 댓글 봐줘 https://fnf.slack.com/archives/C999/p1779747784534769?thread_ts=1779747000.000000&cid=C999",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_called_once()
+        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
+        assert "링크된 댓글 본문" in msg_event.text
+        adapter_with_session_store._app.client.conversations_replies.assert_awaited_once_with(
+            channel="C999",
+            ts="1779747000.000000",
+            latest="1779747784.534769",
+            inclusive=True,
+            limit=50,
+        )
+
+    @pytest.mark.asyncio
+    async def test_thread_context_expands_linked_slack_message_in_root(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """Thread root/prior-reply context includes bodies of Slack messages linked inside it."""
+        adapter_with_session_store.config.extra["prefetch_thread_context_for_routing"] = True
+        mock_session_store._entries = {}
+        adapter_with_session_store._app.client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {
+                    "text": "root has https://fnf.slack.com/archives/C999/p1779747784534769",
+                    "user": "U_OWNER",
+                    "ts": "123.000",
+                },
+                {"text": "current", "user": "U_USER", "ts": "123.456"},
+            ]
+        })
+        adapter_with_session_store._app.client.conversations_history = AsyncMock(return_value={
+            "messages": [
+                {"text": "링크된 스레드 원문", "user": "U_LINKED", "ts": "1779747784.534769"}
+            ]
+        })
+        adapter_with_session_store._app.client.users_info = AsyncMock(return_value={
+            "user": {"profile": {"display_name": "Name"}}
+        })
+
+        event = {
+            "text": "Just replying in the thread",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_not_called()
+        cached = adapter_with_session_store._thread_context_cache["C123:123.000:T_TEAM"]
+        assert "링크된 스레드 원문" in cached.content
 
     @pytest.mark.asyncio
     async def test_owner_confirm_message_confirms_and_executes_latest_proposal(
