@@ -43,7 +43,7 @@ _ensure_slack_mock()
 import plugins.platforms.slack.adapter as _slack_mod
 _slack_mod.SLACK_AVAILABLE = True
 
-from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from plugins.platforms.slack.adapter import SlackAdapter, _extract_text_from_slack_message  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +75,40 @@ def _make_adapter(require_mention=None, strict_mention=None, free_response_chann
     adapter._bot_user_id = BOT_USER_ID
     adapter._team_bot_user_ids = {}
     return adapter
+
+
+# ---------------------------------------------------------------------------
+# Tests: shared Slack message/unfurl extraction
+# ---------------------------------------------------------------------------
+
+
+def test_extract_text_from_slack_message_keeps_message_unfurl_attachment():
+    """Shared Slack messages are user-visible context, not ignorable noise."""
+    msg = {
+        "text": "<@U_BOT_123> 아래 내용으로 인비 준비해줘.",
+        "attachments": [
+            {
+                "is_msg_unfurl": True,
+                "is_thread_root_unfurl": True,
+                "from_url": "https://ffcoit.slack.com/archives/C/p123",
+                "author_name": "FNF PRCS 박봉섭 Roybong",
+                "text": (
+                    "금일 회장님 보고가 10시라서, 프로세스 주간회의는 스킵합니다.\n\n"
+                    "① Alter 개인별 셋업 현황 점검\n"
+                    "② 주요 프로젝트의 Agent Soul, Persona, Claude.md, Agents.md, Skill 및 "
+                    "프로젝트 폴더 구조 이미지 캡쳐해서 주간회의자료에 추가해주세요."
+                ),
+                "footer": "Slack 대화의 스레드",
+            }
+        ],
+    }
+
+    rendered = _extract_text_from_slack_message(msg)
+
+    assert "FNF PRCS 박봉섭 Roybong" in rendered
+    assert "Alter 개인별 셋업 현황" in rendered
+    assert "프로젝트 폴더 구조 이미지 캡쳐" in rendered
+    assert "Slack 대화의 스레드" in rendered
 
 
 # ---------------------------------------------------------------------------
