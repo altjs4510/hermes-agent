@@ -73,6 +73,9 @@ _HERMES_CORE_TOOLS = [
     "computer_use",
     # Cookie-native project registry/cwd/agent routing
     "cookie_project",
+    # Self-improvement feedback loop — non-owner feedback about the bot is
+    # turned into an owner-confirmed improvement proposal (not an external write).
+    "propose_self_improvement",
 ]
 
 # Webhook events may originate from untrusted third-party content (for example,

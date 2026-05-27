@@ -2722,6 +2722,31 @@ class SlackAdapter(BasePlatformAdapter):
 
         store.confirm(proposal_id=proposal_id, actor=user_id, confirm_message_ts=message_ts)
         executor = self._owner_confirm_executors.get(proposal_id)
+        if executor is None and str(proposed.get("action_class") or "") == "self_improvement":
+            # Phase 1 self-improvement feedback loop: there is no in-process
+            # executor (the proposal was raised by the propose_self_improvement
+            # tool, possibly in another thread/process). Approval queues the
+            # plan for the owner to action; auto re-dispatch is Phase 2.
+            # See docs/plans/2026-05-27-self-improvement-feedback-loop.md.
+            try:
+                from tools.self_improvement_tool import (
+                    approval_reply_text,
+                    record_self_improvement_approval,
+                )
+                record_self_improvement_approval(proposed)
+                reply_text = approval_reply_text(proposal_id)
+                result_code = "QUEUED_P1"
+            except Exception as exc:
+                reply_text = f"승인 확인됨, 큐 적재 실패: {exc} proposal={proposal_id}"
+                result_code = "QUEUE_ERROR"
+            store.execute(
+                proposal_id=proposal_id,
+                actor=user_id,
+                result="success" if result_code == "QUEUED_P1" else "failed",
+                result_code=result_code,
+            )
+            await self._send_owner_confirm_reply(channel_id, thread_ts, reply_text)
+            return True
         if executor is None:
             executed = store.execute(
                 proposal_id=proposal_id,
