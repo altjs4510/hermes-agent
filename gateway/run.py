@@ -15361,6 +15361,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cwd,
             timeout,
         )
+        _cp_start = time.monotonic()
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -15396,10 +15397,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         stdout = stdout_b.decode("utf-8", errors="replace").strip()
         stderr = stderr_b.decode("utf-8", errors="replace").strip()
         if proc.returncode != 0:
+            _elapsed = time.monotonic() - _cp_start
+            _rc = proc.returncode
+            # Negative rc = killed by signal (-9 SIGKILL/OOM, -15 SIGTERM, …).
+            _sig = f" (killed by signal {-_rc})" if _rc < 0 else ""
+            # Log stdout too: claude CLI often writes the real failure reason
+            # (rate limit, auth, is_error JSON, input-too-long) to stdout while
+            # leaving stderr empty — which is exactly why an empty `stderr=`
+            # told us nothing on the 2026-05-27 fallback.
             logger.warning(
-                "Slack claude-p-first exited rc=%s stderr=%s; falling back",
-                proc.returncode,
+                "Slack claude-p-first exited rc=%s%s after %.1fs stderr=%r stdout=%r; falling back",
+                _rc,
+                _sig,
+                _elapsed,
                 _redact_gateway_user_facing_secrets(stderr)[:500],
+                _redact_gateway_user_facing_secrets(stdout)[:800],
             )
             return None
 
