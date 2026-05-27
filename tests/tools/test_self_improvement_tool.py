@@ -248,3 +248,51 @@ def test_setup_reminder_cron_skips_without_owner(tmp_path, monkeypatch):
 
     res = sit.setup_reminder_cron(scripts_dir=tmp_path)
     assert res["status"] == "skipped"
+
+
+# --- change double-gate (deterministic) ----------------------------------
+
+def test_change_gate_noop_without_exec_marker(monkeypatch):
+    from tools.self_improvement_tool import maybe_require_change_approval
+
+    # non-change tool, and change tool outside an exec turn → never gated
+    assert maybe_require_change_approval("read_file", {"path": "/x"}) is None
+    assert maybe_require_change_approval("write_file", {"path": "/x", "content": "y"}) is None
+
+
+def test_change_gate_blocks_when_denied(monkeypatch):
+    import tools.self_improvement_tool as sit
+    from gateway.session_context import reset_self_improvement_exec, set_self_improvement_exec
+
+    calls = {}
+    monkeypatch.setattr(
+        "tools.approval.request_gateway_approval",
+        lambda **kw: calls.update(kw) or {"approved": False, "message": "거부"},
+    )
+    tok = set_self_improvement_exec("p_x")
+    try:
+        out = sit.maybe_require_change_approval("write_file", {"path": "/etc/soul", "content": "z"})
+    finally:
+        reset_self_improvement_exec(tok)
+    assert out is not None
+    payload = json.loads(out)
+    assert payload["change_pending"] is True
+    # the approval card carried the path + a preview
+    assert "/etc/soul" in calls["command"]
+    assert calls["pattern_key"] == "self_improvement:apply_change"
+
+
+def test_change_gate_allows_when_approved(monkeypatch):
+    import tools.self_improvement_tool as sit
+    from gateway.session_context import reset_self_improvement_exec, set_self_improvement_exec
+
+    monkeypatch.setattr(
+        "tools.approval.request_gateway_approval",
+        lambda **kw: {"approved": True, "message": None},
+    )
+    tok = set_self_improvement_exec("p_x")
+    try:
+        out = sit.maybe_require_change_approval("patch", {"path": "/f", "patch": "@@"})
+    finally:
+        reset_self_improvement_exec(tok)
+    assert out is None  # approved → write proceeds
