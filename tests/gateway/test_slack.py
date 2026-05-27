@@ -3444,10 +3444,13 @@ class TestThreadReplyHandling:
         assert a._parse_no_reply_emoji(None) == "eyes"
 
     @pytest.mark.asyncio
-    async def test_alter_thread_heuristic_reacts_in_multi_human_thread(
+    async def test_alter_thread_heuristic_routes_multi_human_through_no_reply_gate(
         self, adapter_with_session_store, mock_session_store
     ):
-        """cookie.alter parity: multi-human active threads wait for a fresh mention."""
+        """cookie.alter parity: multi-human active threads no longer go silent
+        waiting for a fresh @mention. They reach the agent with the NO_REPLY
+        directive, which answers messages clearly meant for the bot and stays
+        out of human↔human chatter (emitting NO_REPLY → 👀) otherwise."""
         adapter_with_session_store.config.extra["alter_thread_heuristic"] = True
         session_key = "agent:main:slack:group:C123:123.000:U_USER"
         mock_session_store._entries = {session_key: MagicMock()}
@@ -3473,10 +3476,11 @@ class TestThreadReplyHandling:
 
         await adapter_with_session_store._handle_slack_message(event)
 
-        adapter_with_session_store.handle_message.assert_not_called()
-        adapter_with_session_store._app.client.reactions_add.assert_awaited_once_with(
-            channel="C123", timestamp="123.456", name="eyes"
-        )
+        # The agent is now invoked (not silently skipped) and carries the
+        # NO_REPLY directive so it can judge whether to answer.
+        adapter_with_session_store.handle_message.assert_called_once()
+        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
+        assert "NO_REPLY" in (msg_event.channel_prompt or "")
 
     @pytest.mark.asyncio
     async def test_alter_thread_heuristic_allows_one_human_thread(
@@ -3507,6 +3511,12 @@ class TestThreadReplyHandling:
 
         adapter_with_session_store.handle_message.assert_called_once()
         assert adapter_with_session_store._app.client.conversations_replies.await_count == 1
+        # A one-human owned thread is a 1:1 back-and-forth — a follow-up without
+        # an @mention is still addressed to us, so it must NOT carry the NO_REPLY
+        # directive (which previously made the bot swallow direct instructions
+        # like "응 진행" and stay silent).
+        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
+        assert "NO_REPLY" not in (msg_event.channel_prompt or "")
 
     @pytest.mark.asyncio
     async def test_human_mentioning_other_bot_in_active_thread_yields(

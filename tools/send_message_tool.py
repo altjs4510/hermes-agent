@@ -75,6 +75,8 @@ _GENERIC_SECRET_ASSIGN_RE = re.compile(
     r"\b(access_token|api[_-]?key|auth[_-]?token|signature|sig)\s*=\s*([^\s,;]+)",
     re.IGNORECASE,
 )
+_SLACK_USER_TOKEN_FOOTER = "— sent by Cookie via cookie.hermes"
+_SLACK_BOT_ACCESS_ERRORS = frozenset({"channel_not_found", "not_in_channel"})
 
 
 def _sanitize_error_text(text) -> str:
@@ -95,6 +97,35 @@ def _display_chat_id(platform_name: str, chat_id: str) -> str:
     if platform_name == "signal" and str(chat_id).startswith("group:"):
         return "group:***"
     return chat_id
+
+
+def _append_slack_user_token_footer(message: str) -> str:
+    """Append the Cookie user-token provenance footer once."""
+    text = (message or "").rstrip()
+    if _SLACK_USER_TOKEN_FOOTER in text:
+        return text
+    if not text:
+        return _SLACK_USER_TOKEN_FOOTER
+    return f"{text}\n\n{_SLACK_USER_TOKEN_FOOTER}"
+
+
+def _slack_error_code(result: dict | None) -> str | None:
+    """Extract a Slack Web API error code from a send result."""
+    if not isinstance(result, dict):
+        return None
+    code = result.get("slack_error")
+    if code:
+        return str(code)
+    error = str(result.get("error") or "")
+    match = re.search(r"Slack API error:\s*([A-Za-z0-9_\-]+)", error)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _is_slack_bot_access_error(result: dict | None) -> bool:
+    """Return True when bot-token send failed because the bot cannot access the conversation."""
+    return _slack_error_code(result) in _SLACK_BOT_ACCESS_ERRORS
 
 
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
@@ -646,10 +677,11 @@ def _handle_send(args):
                 from gateway.session_context import get_session_env
                 source_label = get_session_env("HERMES_SESSION_PLATFORM", "cli")
                 user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
+                delivered_mirror_text = result.get("mirror_text") or mirror_text
                 if mirror_to_session(
                     platform_name,
                     chat_id,
-                    mirror_text,
+                    delivered_mirror_text,
                     source_label=source_label,
                     thread_id=thread_id,
                     user_id=user_id,
@@ -1145,7 +1177,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         )
 
     last_result = None
-    for chunk in chunks:
+    for chunk_index, chunk in enumerate(chunks):
         if platform == Platform.SLACK:
             # Cookie owner-confirm: when metadata requests it, route through the
             # adapter so the confirm UI/store is exercised. Otherwise Slack
@@ -1172,6 +1204,18 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                     result = await _slack_entry.standalone_sender_fn(
                         pconfig, chat_id, chunk, thread_id=thread_id
                     )
+                # Cookie user-token fallback: if the bot can't access the
+                # conversation, retry posting as Cookie via SLACK_USER_TOKEN
+                # (owner-approved). Only triggers on the first chunk.
+                if _is_slack_bot_access_error(result) and chunk_index == 0:
+                    fallback_result = await _send_slack_user_token_fallback(
+                        chat_id=chat_id,
+                        chunks=chunks,
+                        start_index=chunk_index,
+                        original_error=result,
+                        thread_id=thread_id,
+                    )
+                    return fallback_result
         elif platform == Platform.WHATSAPP:
             result = await _registry_standalone_send("whatsapp", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.SIGNAL:
@@ -1459,6 +1503,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
 
 # _send_slack moved to the slack plugin as _standalone_send
 # (plugins/platforms/slack/adapter.py), wired via standalone_sender_fn. #41112.
+# The minimal raw poster below is retained ONLY for the Cookie user-token
+# fallback path, which must post with an explicit (user) token rather than the
+# registered bot pconfig.
 
 
 async def _registry_standalone_send(platform_name, pconfig, chat_id, message, thread_id=None):
@@ -1475,6 +1522,121 @@ async def _registry_standalone_send(platform_name, pconfig, chat_id, message, th
     if entry is None or entry.standalone_sender_fn is None:
         return {"error": f"{platform_name} plugin not registered or missing standalone_sender_fn"}
     return await entry.standalone_sender_fn(pconfig, chat_id, message, thread_id=thread_id)
+
+
+async def _send_slack(token, chat_id, message, *, thread_id=None):
+    """Raw Slack Web API send. Retained for the Cookie user-token fallback,
+    which posts with an explicit token (not the registered bot pconfig)."""
+    try:
+        import aiohttp
+    except ImportError:
+        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+    try:
+        from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+        _proxy = resolve_proxy_url()
+        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+        url = "https://slack.com/api/chat.postMessage"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
+            payload = {"channel": chat_id, "text": message, "mrkdwn": True}
+            if thread_id:
+                payload["thread_ts"] = thread_id
+            async with session.post(url, headers=headers, json=payload, **_req_kw) as resp:
+                data = await resp.json()
+                if data.get("ok"):
+                    return {"success": True, "platform": "slack", "chat_id": chat_id, "message_id": data.get("ts")}
+                error_code = data.get("error", "unknown")
+                result = _error(f"Slack API error: {error_code}")
+                result["slack_error"] = error_code
+                return result
+    except Exception as e:
+        return _error(f"Slack send failed: {e}")
+
+
+def _request_slack_user_token_fallback_approval(
+    *,
+    chat_id: str,
+    thread_id: str | None,
+    preview: str,
+    original_error: dict | None,
+) -> tuple[bool, str | None]:
+    """Ask the gateway owner to approve posting as Cookie via SLACK_USER_TOKEN."""
+    try:
+        from gateway.session_context import get_session_env
+
+        source_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        owner_user_id = get_session_env("HERMES_SESSION_USER_ID", "")
+        origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        if source_platform != "slack" or not owner_user_id or not origin_chat_id:
+            return False, "Cookie user-token fallback requires an interactive Slack owner approval session."
+
+        from tools.approval import request_gateway_approval
+
+        error_code = _slack_error_code(original_error) or "unknown"
+        approval = request_gateway_approval(
+            command=(
+                "send_message Slack user-token fallback\n"
+                f"target={chat_id} thread={thread_id or '-'} bot_error={error_code}\n\n"
+                f"{preview}"
+            ),
+            description="Post to Slack as Cookie via SLACK_USER_TOKEN?",
+            pattern_key="tool:send_message:slack:user_token_fallback",
+            allow_permanent=False,
+        )
+        if approval.get("approved"):
+            return True, None
+        return False, approval.get("message") or "Cookie user-token fallback was not approved."
+    except Exception as exc:
+        return False, f"Cookie user-token fallback approval failed: {exc}"
+
+
+async def _send_slack_user_token_fallback(
+    *,
+    chat_id: str,
+    chunks: list[str],
+    start_index: int,
+    original_error: dict | None,
+    thread_id: str | None = None,
+) -> dict:
+    """Retry a bot-inaccessible Slack send using Cookie's user token after approval."""
+    user_token = os.getenv("SLACK_USER_TOKEN", "").strip()
+    if not user_token:
+        return original_error or {"error": "Slack bot-token send failed and SLACK_USER_TOKEN is not set."}
+
+    fallback_chunks = list(chunks[start_index:])
+    if not fallback_chunks:
+        return original_error or {"error": "Slack bot-token send failed before any fallback content was available."}
+    fallback_chunks[-1] = _append_slack_user_token_footer(fallback_chunks[-1])
+
+    preview = "\n\n".join(fallback_chunks).strip()
+    if len(preview) > 1200:
+        preview = preview[:1200] + "..."
+    approved, denial = _request_slack_user_token_fallback_approval(
+        chat_id=chat_id,
+        thread_id=thread_id,
+        preview=preview,
+        original_error=original_error,
+    )
+    if not approved:
+        result: dict[str, Any] = dict(original_error or {"error": "Slack bot-token send failed."})
+        result["user_token_fallback_available"] = True
+        result["approval_required"] = True
+        result["fallback_error"] = _sanitize_error_text(denial or "Cookie user-token fallback was not approved.")
+        return result
+
+    last_result = None
+    for fallback_chunk in fallback_chunks:
+        result = await _send_slack(user_token, chat_id, fallback_chunk, thread_id=thread_id)
+        if isinstance(result, dict) and result.get("error"):
+            result["used_user_token_fallback"] = True
+            return result
+        last_result = result
+
+    if isinstance(last_result, dict):
+        last_result["used_user_token_fallback"] = True
+        last_result["bot_token_error"] = _slack_error_code(original_error) or "unknown"
+        last_result["mirror_text"] = "\n\n".join(fallback_chunks).strip()
+    return last_result or {"error": "Cookie user-token fallback produced no Slack response."}
 
 
 # _send_whatsapp moved to plugins/platforms/whatsapp/adapter.py::_standalone_send,

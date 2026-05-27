@@ -2132,13 +2132,24 @@ class SlackAdapter(BasePlatformAdapter):
         """
         return (
             "You are one of several participants in this Slack thread (the user, "
-            "and possibly other bots). This particular message was not addressed "
-            "to you directly. Reply only if you can add something genuinely "
-            "useful or were clearly expected to. If a reply is unnecessary — "
-            "small talk, acknowledgements, remarks aimed at someone else, or "
-            "something already handled by another participant — output NO_REPLY. "
-            "You may append one emoji name to react in a way that fits the "
-            "moment, e.g. 'NO_REPLY wave' to greet back, 'NO_REPLY +1' or "
+            "and possibly other bots), and this message did not @-mention you. "
+            "Decide whether it is for you.\n"
+            "REPLY (do not output NO_REPLY) when the message is addressed to you, "
+            "even without a mention. This includes: a direct instruction or "
+            "request, however short (e.g. '응 진행', 'ㄱㄱ', '해줘', 'go ahead'); a "
+            "question you can answer or that concerns your work/status; an answer "
+            "or follow-up to something YOU just said — if your own most recent "
+            "message asked a question or proposed an action, a reply to it is for "
+            "you; or a message that only makes sense as directed at you. When a "
+            "message in a thread you are actively in could reasonably be meant for "
+            "you, prefer replying over staying silent.\n"
+            "Output NO_REPLY only when a reply is genuinely unnecessary: two other "
+            "participants talking to each other, an aside aimed at someone else, "
+            "pure small talk or an acknowledgement that needs nothing back, or "
+            "something another participant already handled. Never use NO_REPLY to "
+            "dodge a clear instruction or a question put to you.\n"
+            "With NO_REPLY you may append one emoji name to react, e.g. "
+            "'NO_REPLY wave' to greet back, 'NO_REPLY +1' or "
             "'NO_REPLY white_check_mark' to acknowledge, 'NO_REPLY tada' to "
             "celebrate, 'NO_REPLY pray' to thank, 'NO_REPLY clap' for good work. "
             "Plain 'NO_REPLY' leaves 👀. Use only one emoji name and nothing else."
@@ -3169,33 +3180,45 @@ class SlackAdapter(BasePlatformAdapter):
                     )
                     return
 
-                # cookie.alter parity mode: a bot-owned/active thread should not
-                # become a free-for-all auto-response surface once multiple
-                # humans join.  In that case we acknowledge with 👀 and wait for
-                # a direct mention instead of entering the agent/tool lifecycle.
+                # cookie.alter parity mode: in a bot-owned/active thread, decide
+                # how a non-@mention reply is handled by how many distinct humans
+                # are actually talking in it.
+                thread_human_count: Optional[int] = None
                 if self._slack_alter_thread_heuristic() and is_thread_reply:
-                    human_count = await self._thread_human_participant_count(
+                    thread_human_count = await self._thread_human_participant_count(
                         channel_id=channel_id,
                         thread_ts=event_thread_ts or "",
                         team_id=team_id,
                     )
-                    if human_count is not None and human_count > 1:
-                        if self._reactions_enabled():
-                            await self._add_reaction(channel_id, ts, "eyes")
-                        logger.debug(
-                            "[Slack] alter thread heuristic: reacting instead of responding "
-                            "in multi-human thread %s (humans=%d)",
-                            event_thread_ts,
-                            human_count,
-                        )
-                        return
 
-                # Reached here within the not-mentioned branch = an un-addressed
-                # message in our active thread (no @mention of us, not redirected
-                # to another actor, not a multi-human free-for-all). Whether it
-                # warrants a reply is a semantic call — defer to the agent via
-                # the NO_REPLY directive injected below.
-                unaddressed_thread_reply = True
+                # Single-human owned thread (owner ↔ bot 1:1): a follow-up without
+                # an @mention is still addressed to us — nobody re-@mentions the
+                # bot on every turn of a back-and-forth. Answer it directly.
+                # (Treating these as "un-addressed" made the NO_REPLY gate below
+                # swallow direct instructions like "응 진행", after which the bot
+                # confabulated a "can't read thread history" excuse.)
+                #
+                # Multi-human thread (or participant count unresolved): do NOT go
+                # silent until re-@mentioned — the old behavior here was a bare 👀
+                # and an early return, i.e. exactly the "must @mention to act"
+                # complaint. Instead route it through the NO_REPLY semantic gate:
+                # the agent answers when the message is clearly for it (a direct
+                # instruction/question, or a reply to its own previous message) and
+                # emits NO_REPLY — which still leaves a 👀 — for pure human↔human
+                # chatter. That stops the over-eager silence without turning the
+                # bot into a barge-in machine.
+                #
+                # Cases that must never reach the agent are already handled above:
+                # an explicit @mention of a *different* actor (👀 + return), and
+                # threads we don't own (return).
+                if (
+                    self._slack_alter_thread_heuristic()
+                    and thread_human_count is not None
+                    and thread_human_count <= 1
+                ):
+                    unaddressed_thread_reply = False
+                else:
+                    unaddressed_thread_reply = True
 
         if is_mentioned:
             # Strip the bot mention from the text
@@ -4170,6 +4193,13 @@ class SlackAdapter(BasePlatformAdapter):
                 inclusive=True,
             )
             messages = result.get("messages", []) if result else []
+            # Edge case: thread_ts present but root not found (empty message list).
+            # conversations.replies returns [] when the root message is gone/inaccessible.
+            # Treat as "unknown" (None) to fail-closed: the caller's heuristic will
+            # route this as a multi-human thread (unaddressed_thread_reply=True) rather
+            # than allowing a direct 1:1 auto-response with an unverifiable context.
+            if not messages:
+                return None
             bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
             humans = set()
             for msg in messages:
