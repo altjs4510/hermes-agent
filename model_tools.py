@@ -1102,6 +1102,22 @@ def handle_function_call(
             if function_name in {"write_file", "patch"}:
                 return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
 
+        # Self-improvement change double-gate: during a Phase 2 re-dispatch the
+        # agent runs as the owner (write-capable), so force an owner-confirm card
+        # before any write_file/patch applies. No-op outside an exec turn.
+        try:
+            from tools.self_improvement_tool import maybe_require_change_approval
+
+            si_block_message = maybe_require_change_approval(function_name, function_args)
+            if si_block_message is not None:
+                return si_block_message
+        except Exception as _si_gate_err:
+            logger.debug("self-improvement change gate error: %s", _si_gate_err)
+            if function_name in {"write_file", "patch"}:
+                return json.dumps(
+                    {"error": "자가발전 변경 게이트 실패로 적용 보류"}, ensure_ascii=False
+                )
+
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
         if function_name not in _READ_SEARCH_TOOLS:

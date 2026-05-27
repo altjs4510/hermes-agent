@@ -2706,11 +2706,22 @@ class SlackAdapter(BasePlatformAdapter):
                 internal=True,
             )
 
+            from gateway.session_context import (
+                reset_self_improvement_exec,
+                set_self_improvement_exec,
+            )
+
             async def _run() -> None:
+                # Marker propagates to the turn's tool dispatch (same path as the
+                # HERMES_SESSION_* vars) so the file-write guard forces an
+                # owner-confirm before any write_file/patch in this turn.
+                tok = set_self_improvement_exec(proposal_id)
                 try:
                     await runner._handle_message(event)
                 except Exception as exc:
                     logger.warning("self_improvement exec run failed for %s: %s", proposal_id, exc)
+                finally:
+                    reset_self_improvement_exec(tok)
 
             asyncio.create_task(_run())
             logger.info("self_improvement exec: dispatched %s as owner in %s", proposal_id, dm_channel)
@@ -2788,11 +2799,24 @@ class SlackAdapter(BasePlatformAdapter):
         store.confirm(proposal_id=proposal_id, actor=user_id, confirm_message_ts=message_ts)
         executor = self._owner_confirm_executors.get(proposal_id)
         if executor is None and str(proposed.get("action_class") or "") == "self_improvement":
-            # Phase 1 self-improvement feedback loop: there is no in-process
-            # executor (the proposal was raised by the propose_self_improvement
-            # tool, possibly in another thread/process). Approval queues the
-            # plan for the owner to action; auto re-dispatch is Phase 2.
+            # Self-improvement feedback loop: there is no in-process executor
+            # (the proposal was raised by the propose_self_improvement tool,
+            # possibly in another thread/process). Approval queues the plan and
+            # re-dispatches it as the owner (Phase 2).
             # See docs/plans/2026-05-27-self-improvement-feedback-loop.md.
+            #
+            # Idempotency guard: a double approval (e.g. Slack double-click /
+            # button+text) must not queue or re-dispatch twice. Once an
+            # ``executed`` event exists for this proposal, treat repeats as a
+            # no-op. (store.execute is itself idempotent, but the re-dispatch
+            # and queue-append happen outside it, so guard here.)
+            if any(e.get("state") == "executed" for e in store.lookup(proposal_id)):
+                await self._send_owner_confirm_reply(
+                    channel_id,
+                    thread_ts,
+                    f"이미 처리된 자가발전 승인이라 중복 실행 안 했어. proposal={proposal_id}",
+                )
+                return True
             try:
                 from tools.self_improvement_tool import (
                     approval_reply_text,

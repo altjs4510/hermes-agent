@@ -253,6 +253,60 @@ def record_self_improvement_approval(proposed: Dict[str, Any]) -> Dict[str, Any]
     return entry
 
 
+_CHANGE_TOOLS = {"write_file", "patch"}
+
+
+def maybe_require_change_approval(function_name: str, function_args: Dict[str, Any]) -> Optional[str]:
+    """Deterministic change double-gate for self-improvement execution turns.
+
+    During a Phase 2 re-dispatch the agent runs as the owner (write-capable), so a
+    prompt-level "ask before applying" rule is not enough — this forces an
+    owner-confirm card (via the gateway approval UI) before any ``write_file`` /
+    ``patch`` lands. Returns ``None`` to allow the write, or a JSON tool-error
+    string to block it. No-op outside a self-improvement exec turn (returns None),
+    so the owner's normal sessions keep writing freely.
+    """
+    if function_name not in _CHANGE_TOOLS:
+        return None
+    try:
+        from gateway.session_context import get_self_improvement_exec
+        proposal_id = get_self_improvement_exec()
+    except Exception:
+        return None
+    if not proposal_id:
+        return None
+
+    path = ""
+    for key in ("path", "file_path", "filename", "file"):
+        if isinstance(function_args.get(key), str):
+            path = function_args[key]
+            break
+    body = function_args.get("content") or function_args.get("patch") or function_args.get("diff") or ""
+    preview = str(body)
+    if len(preview) > 600:
+        preview = preview[:600] + "…"
+
+    try:
+        from tools.approval import request_gateway_approval
+        result = request_gateway_approval(
+            command=f"{function_name} {path}\n\n{preview}",
+            description=f"자가발전 실행 — 파일 변경 적용? ({path or function_name})",
+            pattern_key="self_improvement:apply_change",
+            allow_permanent=False,
+        )
+    except Exception as exc:  # pragma: no cover - defensive: fail safe (block)
+        logger.warning("self_improvement change-gate error: %s", exc)
+        return json.dumps(
+            {"error": f"자가발전 변경 게이트 오류로 적용 보류: {exc}"}, ensure_ascii=False
+        )
+
+    if result.get("approved"):
+        return None
+    # Not approved (denied, pending, or no notify channel) → block the write.
+    msg = result.get("message") or "쿠키가 변경 적용을 승인하지 않아 파일을 바꾸지 않았어."
+    return json.dumps({"error": msg, "change_pending": True}, ensure_ascii=False)
+
+
 def approval_reply_text(proposal_id: str) -> str:
     """Owner-facing reply shown after approving a self-improvement card.
 
