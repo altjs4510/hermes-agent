@@ -170,6 +170,39 @@ def reset_session_vars() -> None:
     _runtime_cwd("clear_session_cwd")
 
 
+# ---------------------------------------------------------------------------
+# Self-improvement execution marker
+# ---------------------------------------------------------------------------
+# Set while a self-improvement plan is being re-dispatched as the owner (Phase 2
+# of the feedback loop). The owner runs write-capable, so the only thing
+# standing between a non-owner's approved feedback and a real SOUL/config edit is
+# this marker: when it's set, the file-write guard forces an owner-confirm card
+# before any write_file/patch lands (the deterministic "변경 이중게이트"). It's a
+# ContextVar so concurrent turns don't leak the marker into each other.
+_SELF_IMPROVEMENT_EXEC: ContextVar = ContextVar("HERMES_SELF_IMPROVEMENT_EXEC", default="")
+
+
+def set_self_improvement_exec(proposal_id: str):
+    """Mark the current context as a self-improvement execution turn.
+
+    Returns the reset token; pass it to ``reset_self_improvement_exec`` (or just
+    let the task end). ``proposal_id`` is recorded for audit/preview text.
+    """
+    return _SELF_IMPROVEMENT_EXEC.set(proposal_id or "")
+
+
+def reset_self_improvement_exec(token) -> None:
+    try:
+        _SELF_IMPROVEMENT_EXEC.reset(token)
+    except Exception:
+        pass
+
+
+def get_self_improvement_exec() -> str:
+    """Return the active self-improvement proposal_id, or '' when not in an exec turn."""
+    return _SELF_IMPROVEMENT_EXEC.get()
+
+
 def get_session_env(name: str, default: str = "") -> str:
     """Read a session var by legacy ``HERMES_SESSION_*`` name; drop-in for os.getenv.  The
     ContextVar wins if ever set here (even to ``""``); else ``os.environ``; else *default*."""

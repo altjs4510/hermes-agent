@@ -119,4 +119,22 @@ non-owner(팀원/이사님)가 **봇 자신에 대한 피드백/개선요청**�
 - 테스트: `tests/tools/test_self_improvement_tool.py` 10건(본문 사이드카, 실행 프롬프트 이중게이트, pending_summary
   정렬/무소음, 리마인드 cron 멱등/owner없음 스킵, 승인 통합) + slack/owner_confirm 회귀 통과.
 
-남은 것(Phase 3 후보): 변경 이중게이트의 *결정적* 강제(owner 세션 write 후킹), stale 90일 자동 정리.
+남은 것(Phase 3 후보): stale 90일 자동 정리, 게이트 카드 UX 다듬기.
+
+### 라이브 검증 발견 + 후속 (2026-05-28)
+
+P2 라이브 테스트(이사님 피드백 승인 → 재디스패치)에서:
+- ✅ 재디스패치는 완벽 작동 — owner 권한 에이전트가 `persona/tone.md` 에 plan(§8 "첫 줄=결론") 정확히 반영.
+- ❌ **이중게이트가 프롬프트 레벨로는 무효** — owner 권한이라 write_file 이 자유로워 컨펌 없이 바로 적용됨. (예상 리스크 현실화)
+- ❌ Slack 더블클릭 → 중복 승인 → 재디스패치 2회.
+
+**후속 (구현 완료):**
+1. **중복 dispatch 방지** — `slack.py` 승인 분기에 `executed` 이벤트 존재 시 no-op 가드.
+2. **결정적 이중게이트** — 프롬프트가 아니라 코드로 강제:
+   - `gateway/session_context.py` — `_SELF_IMPROVEMENT_EXEC` ContextVar + set/get/reset. 재디스패치
+     `_run()` 에서 set → 그 턴 tool dispatch 까지 전파(HERMES_SESSION_* 와 동일 경로).
+   - `tools/self_improvement_tool.py::maybe_require_change_approval` — exec 마커 활성 + `write_file`/`patch` 면
+     `request_gateway_approval`(게이트웨이 승인 카드+버튼+텍스트 fallback) 로 owner 컨펌 강제. 승인 전 write 차단.
+     exec 턴 밖에선 no-op(owner 일반 세션은 자유).
+   - `model_tools.py` dispatch — ACP edit-approval 가드 옆에 호출. 게이트 오류 시 fail-safe(차단).
+   - tone.md §8 변경은 합리적이라 유지(쿠키 결정).
