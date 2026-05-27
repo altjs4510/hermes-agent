@@ -116,6 +116,11 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     """
     from gateway.config import Platform
 
+    # Snapshot the prior directory before we overwrite it, so we can detect and
+    # alert the owner about newly-appeared Slack surfaces (a channel the bot was
+    # invited to, or a DM from someone new) on this rebuild.
+    previous_directory = load_directory()
+
     platforms: Dict[str, List[Dict[str, str]]] = {}
 
     for platform, adapter in adapters.items():
@@ -160,7 +165,80 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("Channel directory: failed to write: %s", e)
 
+    # Observability: with Slack open to everyone (SLACK_ALLOW_ALL_USERS), the
+    # owner manages WHERE the bot operates, not WHO talks to it. Alert the owner
+    # when a new channel/DM appears so an unnoticed invite or a stranger's DM
+    # never goes unseen. Fully guarded — never breaks directory building.
+    try:
+        await _notify_owner_new_slack_surfaces(adapters, previous_directory, directory)
+    except Exception as e:
+        logger.debug("Channel directory: owner surface-alert skipped: %s", e)
+
     return directory
+
+
+def _slack_surface_index(directory: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Map top-level Slack surface id -> entry, excluding thread sub-entries.
+
+    Thread entries use a compound ``chat_id:thread_ts`` id; we only track
+    channels and DMs (the surfaces the owner cares to manage), not every thread.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for ch in directory.get("platforms", {}).get("slack", []) or []:
+        cid = ch.get("id")
+        if not cid or ":" in str(cid):
+            continue
+        out[str(cid)] = ch
+    return out
+
+
+async def _notify_owner_new_slack_surfaces(
+    adapters: Dict[Any, Any],
+    previous: Dict[str, Any],
+    current: Dict[str, Any],
+) -> None:
+    """DM the owner(s) when the bot appears in Slack channels/DMs it wasn't in
+    on the previous rebuild. No-op on first run (empty prior snapshot) to avoid
+    alerting on the entire pre-existing set."""
+    import os
+
+    owner_ids = [u.strip() for u in os.getenv("HERMES_OWNER_IDS", "").split(",") if u.strip()]
+    if not owner_ids:
+        return
+
+    prev_idx = _slack_surface_index(previous)
+    if not prev_idx:
+        return  # first run / no prior snapshot — don't alert on existing surfaces
+    cur_idx = _slack_surface_index(current)
+    new_ids = [cid for cid in cur_idx if cid not in prev_idx]
+    if not new_ids:
+        return
+
+    from gateway.config import Platform
+    adapter = adapters.get(Platform.SLACK)
+    if adapter is None:
+        return
+    client = None
+    team_clients = getattr(adapter, "_team_clients", None) or {}
+    if team_clients:
+        client = next(iter(team_clients.values()))
+    elif getattr(adapter, "_app", None) is not None:
+        client = adapter._app.client
+    if client is None:
+        return
+
+    lines = ["🆕 알터가 새 Slack surface에 들어갔어요 (인지 못 한 추가일 수 있음):"]
+    for cid in new_ids:
+        ch = cur_idx[cid]
+        lines.append(f"• {ch.get('name', cid)} ({ch.get('type', '')}) — `{cid}`")
+    lines.append("\n모르는 거면 채널에서 봇을 제거하세요.")
+    text = "\n".join(lines)
+
+    for owner in owner_ids:
+        try:
+            await client.chat_postMessage(channel=owner, text=text)
+        except Exception as e:
+            logger.warning("Channel directory: failed to DM owner %s about new surfaces: %s", owner, e)
 
 
 def _build_discord(adapter) -> List[Dict[str, str]]:
