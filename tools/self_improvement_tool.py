@@ -46,13 +46,67 @@ from tools.registry import registry, tool_error, tool_result
 logger = logging.getLogger(__name__)
 
 
-# Queue of owner-approved self-improvement proposals awaiting execution.
-# Phase 1 stops here (append-only audit + work queue); Phase 2 re-dispatches.
+# Queue of owner-approved self-improvement proposals awaiting/under execution.
+# Append-only work log; the proposal lifecycle (proposed→confirmed→executed) is
+# tracked authoritatively in the owner-confirm JSONL.
 _QUEUE_PATH = Path(os.path.expanduser("~/.hermes/state/self-improvement-queue.jsonl"))
+
+# Per-proposal sidecar holding the full feedback/plan text. The owner-confirm
+# store keeps only refs (target_ref/preview_ref), so Phase 2 execution and the
+# reminder digest read the body from here, keyed by proposal_id.
+_PROPOSALS_DIR = Path(os.path.expanduser("~/.hermes/state/self-improvement-proposals"))
 
 _ACTION_CLASS = "self_improvement"
 _CONFIRM_VERB = "반영"
 _TOKEN_TTL_SEC = 24 * 3600  # owner may not see the DM for a while — be generous
+
+
+def _save_proposal_body(proposal_id: str, body: Dict[str, Any]) -> None:
+    """Persist the full proposal body (feedback/plan/...) keyed by proposal_id."""
+    _PROPOSALS_DIR.mkdir(parents=True, exist_ok=True)
+    (_PROPOSALS_DIR / f"{proposal_id}.json").write_text(
+        json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def load_proposal_body(proposal_id: str) -> Optional[Dict[str, Any]]:
+    """Load a saved proposal body, or None if absent/unreadable."""
+    p = _PROPOSALS_DIR / f"{proposal_id}.json"
+    try:
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("self_improvement: failed to read body %s: %s", proposal_id, e)
+    return None
+
+
+def build_execution_prompt(body: Dict[str, Any]) -> str:
+    """Build the owner-context re-dispatch prompt for an approved proposal.
+
+    Implements the "변경 이중게이트" safety model (option 2): the executing
+    agent runs with owner privileges but must surface a change summary and get
+    explicit owner confirmation before applying any hard-to-reverse change
+    (file write / config / SOUL edit). Read/analysis/drafting are free.
+    """
+    feedback = (body.get("feedback") or "").strip()
+    plan = (body.get("plan") or "").strip()
+    provider = (body.get("provider_label") or "누군가").strip()
+    summary = (body.get("summary") or "").strip()
+    title = f" ({summary})" if summary else ""
+    return (
+        f"[자가발전 실행 모드]{title} 아래는 '{provider}' 가 준 봇 개선 피드백을 네가 제안하고 "
+        f"쿠키(owner)가 승인한 개선안이야. 지금 owner 권한으로 이걸 실제로 반영해줘.\n\n"
+        f"피드백:\n{feedback}\n\n"
+        f"승인된 개선안:\n{plan}\n\n"
+        f"실행 규칙:\n"
+        f"1. 먼저 무엇을 어떤 파일/설정/SOUL 항목에서 어떻게 바꿀지 구체적으로 정해라.\n"
+        f"2. 파일 쓰기·설정 변경·SOUL 수정 등 되돌리기 어려운 변경을 적용하기 *직전에* "
+        f"변경 요약(어떤 파일을 어떻게)을 쿠키에게 제시하고 명시적 승인(👍 또는 \"적용해\")을 받아라. "
+        f"승인 전엔 실제 적용하지 마라.\n"
+        f"3. 읽기·조사·변경안 작성은 자유. 외부 전송/커밋 등 side-effect 는 기존 정책대로 게이트.\n"
+        f"4. 끝나면 무엇을 했는지(또는 무엇을 승인 대기 중인지) 1~2줄로 요약해.\n"
+        f"5. 피드백이 모호하거나 봇을 바꾸기에 부적절하면 적용하지 말고 그 이유를 쿠키에게 보고만 해."
+    )
 
 
 def _now_z() -> str:
@@ -200,11 +254,141 @@ def record_self_improvement_approval(proposed: Dict[str, Any]) -> Dict[str, Any]
 
 
 def approval_reply_text(proposal_id: str) -> str:
-    """Owner-facing reply shown after approving a Phase 1 self-improvement card."""
+    """Owner-facing reply shown after approving a self-improvement card.
+
+    Re-dispatch (owner-context execution) is fired separately by the gateway; this
+    line just confirms the approval landed.
+    """
     return (
-        f"✅ 자가발전 제안 승인됨 — 실행 큐에 적재했어. proposal={proposal_id}\n"
-        f"(재디스패치 자동 실행은 Phase 2에서 연결돼.)"
+        f"✅ 자가발전 제안 승인됨 — owner 컨텍스트로 실행을 시작할게. proposal={proposal_id}\n"
+        f"(실제 변경 적용 전에 변경 요약으로 한 번 더 확인 받을게.)"
     )
+
+
+_TIER_RANK = {"high": 0, "normal": 1, "low": 2}
+
+
+def _age_str(created_iso: str) -> str:
+    try:
+        created = datetime.fromisoformat(created_iso.replace("Z", "+00:00"))
+        days = (datetime.now(timezone.utc) - created).days
+        return f"{days}일째" if days > 0 else "오늘"
+    except Exception:
+        return "?"
+
+
+def pending_summary() -> str:
+    """Korean digest of proposals still awaiting the owner (latest state=proposed).
+
+    Sorted by priority (executive→PRCS→other) then age (oldest first). Used by the
+    weekly reminder cron so deferred feedback resurfaces instead of rotting.
+    """
+    store_path = Path(_owner_confirm_store_path())
+    if not store_path.exists():
+        return ""
+    events: list[Dict[str, Any]] = []
+    for line in store_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            try:
+                events.append(json.loads(line))
+            except Exception:
+                continue
+    # Latest state per proposal; keep only self_improvement still "proposed".
+    latest: Dict[str, Dict[str, Any]] = {}
+    for ev in events:
+        pid = ev.get("proposal_id")
+        if pid:
+            latest[pid] = ev  # events are append-ordered → last wins
+    pending = [
+        ev for ev in latest.values()
+        if ev.get("action_class") == _ACTION_CLASS and ev.get("state") == "proposed"
+    ]
+    if not pending:
+        return ""  # empty → weekly cron stays silent (no noise)
+
+    rows = []
+    for ev in pending:
+        body = load_proposal_body(ev.get("proposal_id", "")) or {}
+        tier = body.get("tier") or ev.get("risk_level") or "low"
+        rows.append({
+            "tier": tier,
+            "created": body.get("created") or ev.get("ts") or "",
+            "provider": body.get("provider_label") or "외부 사용자",
+            "summary": body.get("summary") or (body.get("feedback") or "")[:40] or ev.get("preview_ref", ""),
+            "token": ev.get("token", ""),
+        })
+    rows.sort(key=lambda r: (_TIER_RANK.get(r["tier"], 9), r["created"]))
+
+    badge = {"high": "🔴", "normal": "🟡", "low": "⚪"}
+    lines = [f"🛠 미처리 자가발전 제안 {len(rows)}건 (우선순위·오래된 순)\n"]
+    for r in rows:
+        lines.append(
+            f"{badge.get(r['tier'], '⚪')} [{_age_str(r['created'])}] {r['provider']} — {r['summary']}"
+        )
+    lines.append("\n승인하려면 해당 카드에서 버튼을 누르거나, 오래된 건 다시 올려달라고 말해줘.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Weekly reminder cron (deferred-feedback resurfacing)
+# ---------------------------------------------------------------------------
+
+_SCRIPTS_DIR = Path(os.path.expanduser("~/.hermes/scripts"))
+_DIGEST_SCRIPT_NAME = "self_improvement_digest.py"
+_REMINDER_JOB_NAME = "self-improvement-queue-reminder"
+
+# Deterministic no_agent cron script: imports pending_summary (the hermes-agent
+# package is editable-installed in the venv, so this resolves regardless of cwd)
+# and prints it. Empty output → cron delivers nothing (silent when no backlog).
+_DIGEST_SCRIPT = '''#!/usr/bin/env python3
+"""Auto-generated by tools/self_improvement_tool.setup_reminder_cron.
+Weekly self-improvement pending-feedback digest for cron delivery."""
+from tools.self_improvement_tool import pending_summary
+
+s = pending_summary()
+if s.strip():
+    print(s)
+'''
+
+
+def setup_reminder_cron(
+    owner_id: Optional[str] = None,
+    schedule: str = "0 9 * * 1",  # Mondays 09:00
+    scripts_dir: Optional[os.PathLike[str] | str] = None,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """Install the weekly deferred-feedback reminder (script + cron job).
+
+    Idempotent: writes the digest script and registers a ``no_agent`` cron job
+    that delivers its stdout to the owner's Slack DM. Re-running refreshes the
+    script and (unless ``force``) leaves an existing job in place.
+    """
+    owner_id = owner_id or (_owner_ids()[0] if _owner_ids() else "")
+    if not owner_id:
+        return {"status": "skipped", "reason": "no owner id (HERMES_OWNER_IDS unset)"}
+
+    sd = Path(scripts_dir) if scripts_dir else _SCRIPTS_DIR
+    sd.mkdir(parents=True, exist_ok=True)
+    script_path = sd / _DIGEST_SCRIPT_NAME
+    script_path.write_text(_DIGEST_SCRIPT, encoding="utf-8")
+
+    from cron.jobs import create_job, load_jobs
+
+    existing = [j for j in load_jobs() if j.get("name") == _REMINDER_JOB_NAME]
+    if existing and not force:
+        return {"status": "exists", "job_id": existing[0].get("id"), "script": str(script_path)}
+
+    job = create_job(
+        prompt=None,
+        schedule=schedule,
+        name=_REMINDER_JOB_NAME,
+        script=_DIGEST_SCRIPT_NAME,
+        no_agent=True,
+        deliver="origin",
+        origin={"platform": "slack", "chat_id": owner_id},
+    )
+    return {"status": "created", "job_id": job.get("id"), "script": str(script_path)}
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +462,22 @@ def _handle_propose(args: Dict[str, Any], **_: Any) -> str:
     target_ref = f"{platform or 'unknown'}:{src_chat or '-'}:{src_thread or 'root'}"
     preview_ref = f"self-improvement:{summary or feedback[:40]}"
     risk_level = "high" if urgent else ("normal" if tier == "normal" else "low")
+
+    # Persist the full body up front so Phase 2 execution / the reminder digest
+    # can recover feedback+plan by proposal_id even if DM delivery fails.
+    _save_proposal_body(proposal_id, {
+        "proposal_id": proposal_id,
+        "created": _now_z(),
+        "feedback": feedback,
+        "plan": plan,
+        "summary": summary,
+        "provider_label": provider_label,
+        "tier": tier,
+        "urgent": urgent,
+        "actor": actor,
+        "owner": owner_id,
+        "target_ref": target_ref,
+    })
 
     owner_notified = False
     delivery_channel = ""

@@ -18,11 +18,13 @@ def isolated_paths(tmp_path, monkeypatch):
     """Point the owner-confirm store and the SI queue at temp files."""
     store_path = tmp_path / "owner-confirm.jsonl"
     queue_path = tmp_path / "self-improvement-queue.jsonl"
+    proposals_dir = tmp_path / "proposals"
     monkeypatch.setenv("HERMES_OWNER_CONFIRM_AUDIT_PATH", str(store_path))
 
     import tools.self_improvement_tool as sit
 
     monkeypatch.setattr(sit, "_QUEUE_PATH", queue_path)
+    monkeypatch.setattr(sit, "_PROPOSALS_DIR", proposals_dir)
     return store_path, queue_path
 
 
@@ -157,3 +159,92 @@ async def test_owner_approval_queues_self_improvement(isolated_paths, monkeypatc
     # Store shows confirmed + executed(QUEUED_P1).
     states = [e["state"] for e in store.lookup(proposed["proposal_id"])]
     assert "confirmed" in states and "executed" in states
+
+
+# --- Phase 2 -------------------------------------------------------------
+
+def test_proposal_body_saved_and_loadable(isolated_paths, monkeypatch):
+    monkeypatch.delenv("HERMES_OWNER_IDS", raising=False)
+    _set_session(monkeypatch, user_id="U0AM13JAWM8")  # director-ish id
+    from tools.self_improvement_tool import _handle_propose, load_proposal_body
+
+    out = json.loads(_handle_propose({"feedback": "X 피드백", "plan": "Y 계획", "summary": "Z"}))
+    body = load_proposal_body(out["proposal_id"])
+    assert body is not None
+    assert body["feedback"] == "X 피드백"
+    assert body["plan"] == "Y 계획"
+    assert body["summary"] == "Z"
+    assert body["target_ref"].startswith("slack:")
+
+
+def test_build_execution_prompt_has_double_gate():
+    from tools.self_improvement_tool import build_execution_prompt
+
+    p = build_execution_prompt({
+        "feedback": "응답이 장황", "plan": "결론 먼저", "provider_label": "이사 박봉섭", "summary": "간결성",
+    })
+    assert "자가발전 실행 모드" in p
+    assert "이사 박봉섭" in p
+    assert "결론 먼저" in p
+    # the change double-gate must be present
+    assert "승인" in p and ("적용" in p)
+
+
+def test_pending_summary(isolated_paths, monkeypatch):
+    store_path, _ = isolated_paths
+    # empty store → silent
+    from tools.self_improvement_tool import _save_proposal_body, pending_summary
+    from gateway.owner_confirm import OwnerConfirmStore
+
+    assert pending_summary() == ""
+
+    store = OwnerConfirmStore(str(store_path))
+    # one executive (high) proposal left in "proposed" state
+    pr = store.propose(
+        channel="D1", thread_ts="t1", actor="U0AM13JAWM8", owner="UOWNER",
+        action_class="self_improvement", confirm_verb="반영", token="AAAA",
+        target_ref="slack:C1:root", preview_ref="self-improvement:간결성", risk_level="high",
+    )
+    _save_proposal_body(pr["proposal_id"], {
+        "created": "2026-05-01T00:00:00Z", "tier": "high",
+        "provider_label": "이사 박봉섭", "summary": "응답 간결성", "feedback": "장황",
+    })
+    s = pending_summary()
+    assert "미처리 자가발전 제안 1건" in s
+    assert "이사 박봉섭" in s and "🔴" in s
+
+    # once confirmed, it drops out of the pending digest
+    store.confirm(proposal_id=pr["proposal_id"], actor="UOWNER", confirm_message_ts="m1")
+    assert pending_summary() == ""
+
+
+def test_setup_reminder_cron(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_OWNER_IDS", "UOWNER")
+    import tools.self_improvement_tool as sit
+
+    created = {}
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda *a, **k: [])
+    monkeypatch.setattr("cron.jobs.create_job", lambda **kw: created.update(kw) or {"id": "job_x"})
+
+    res = sit.setup_reminder_cron(scripts_dir=tmp_path, schedule="0 9 * * 1")
+    assert res["status"] == "created" and res["job_id"] == "job_x"
+    # script written and imports pending_summary
+    script = (tmp_path / sit._DIGEST_SCRIPT_NAME).read_text(encoding="utf-8")
+    assert "from tools.self_improvement_tool import pending_summary" in script
+    # cron job wired no_agent + owner DM origin
+    assert created["no_agent"] is True
+    assert created["origin"] == {"platform": "slack", "chat_id": "UOWNER"}
+    assert created["script"] == sit._DIGEST_SCRIPT_NAME
+
+    # idempotent: existing job by name → not recreated
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda *a, **k: [{"name": sit._REMINDER_JOB_NAME, "id": "job_x"}])
+    res2 = sit.setup_reminder_cron(scripts_dir=tmp_path)
+    assert res2["status"] == "exists"
+
+
+def test_setup_reminder_cron_skips_without_owner(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_OWNER_IDS", raising=False)
+    import tools.self_improvement_tool as sit
+
+    res = sit.setup_reminder_cron(scripts_dir=tmp_path)
+    assert res["status"] == "skipped"
