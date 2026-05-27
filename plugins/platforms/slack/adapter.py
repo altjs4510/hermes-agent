@@ -2107,7 +2107,40 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] reactions.add failed (%s): %s", emoji, e)
             return False
 
-    async def _remove_reaction(self, channel: str, timestamp: str, emoji: str) -> bool:
+    async def _ack_no_reply(self, event: "MessageEvent") -> None:
+        """React with 👀 when the agent chose not to reply (NO_REPLY).
+
+        Mirrors the "seen but intentionally not answered" signal the gating
+        layer already uses for multi-actor yields, so a suppressed reply isn't
+        silently dropped.
+        """
+        if not self._reactions_enabled():
+            return
+        channel = getattr(event.source, "chat_id", None)
+        ts = event.message_id
+        if channel and ts:
+            await self._add_reaction(channel, ts, "eyes")
+
+    def _no_reply_thread_directive(self) -> str:
+        """Ephemeral instruction appended for un-addressed thread messages.
+
+        Tells the agent it is one of several thread participants and should
+        emit the NO_REPLY sentinel when a reply isn't warranted, instead of
+        answering just because the message reached it.
+        """
+        return (
+            "You are one of several participants in this Slack thread (the user, "
+            "and possibly other bots). This particular message was not addressed "
+            "to you directly. Reply only if you can add something genuinely "
+            "useful or were clearly expected to. If a reply is unnecessary — "
+            "small talk, acknowledgements, remarks aimed at someone else, or "
+            "something already handled by another participant — output exactly "
+            "NO_REPLY and nothing else."
+        )
+
+    async def _remove_reaction(
+        self, channel: str, timestamp: str, emoji: str
+    ) -> bool:
         """Remove an emoji reaction from a message. Returns True on success."""
         if not self._app:
             return False
@@ -3035,6 +3068,9 @@ class SlackAdapter(BasePlatformAdapter):
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
         prefetched_thread_context = ""
+        # Set when a message reaches us via thread membership (not a direct
+        # @mention) — the agent then decides reply-vs-NO_REPLY semantically.
+        unaddressed_thread_reply = False
         if (
             not is_dm
             and is_thread_reply
@@ -3099,6 +3135,34 @@ class SlackAdapter(BasePlatformAdapter):
                 ):
                     return
 
+                # Multi-actor yield: the thread is ours (we were mentioned /
+                # posted / hold a session), but this message explicitly
+                # @-mentions someone other than us — so the turn is addressed to
+                # that actor, not Hermes. In a multi-actor channel (cookie.alter
+                # + cookie.hermes + people) the mentioned-thread memory would
+                # otherwise make us barge into a reply meant for the other party
+                # — exactly how "you were right" got mis-read as being said to
+                # us. is_mentioned is False here, so any <@…> token is
+                # necessarily a *different* actor. Ack with 👀 and wait for a
+                # fresh direct mention.
+                #
+                # Author-agnostic on purpose: a human or a bot explicitly naming
+                # a third party is the same signal — "not your turn." The
+                # respond-vs-stay-quiet judgement for *un-addressed* messages
+                # (e.g. a plain "안녕" from another bot) is a separate, semantic
+                # decision handled by the NO_REPLY sentinel downstream, not here.
+                # (Channel/here/subteam broadcasts use <!…> and aren't matched.)
+                if re.search(r"<@[A-Z0-9]+>", routing_text):
+                    if self._reactions_enabled():
+                        await self._add_reaction(channel_id, ts, "eyes")
+                    logger.debug(
+                        "[Slack] yielding: thread %s message @-mentions another "
+                        "actor, not this bot (%s)",
+                        event_thread_ts,
+                        bot_uid,
+                    )
+                    return
+
                 # cookie.alter parity mode: a bot-owned/active thread should not
                 # become a free-for-all auto-response surface once multiple
                 # humans join.  In that case we acknowledge with 👀 and wait for
@@ -3119,6 +3183,13 @@ class SlackAdapter(BasePlatformAdapter):
                             human_count,
                         )
                         return
+
+                # Reached here within the not-mentioned branch = an un-addressed
+                # message in our active thread (no @mention of us, not redirected
+                # to another actor, not a multi-human free-for-all). Whether it
+                # warrants a reply is a semantic call — defer to the agent via
+                # the NO_REPLY directive injected below.
+                unaddressed_thread_reply = True
 
         if is_mentioned:
             # Strip the bot mention from the text
@@ -3469,6 +3540,16 @@ class SlackAdapter(BasePlatformAdapter):
                 )
             except Exception:  # pragma: no cover - defensive
                 reply_to_text = None
+
+        # Un-addressed thread message: append the NO_REPLY directive as an
+        # ephemeral channel prompt (applied at API time, never persisted) so
+        # the agent can stay quiet on small talk / asides while still answering
+        # when genuinely useful.
+        if unaddressed_thread_reply:
+            _directive = self._no_reply_thread_directive()
+            _channel_prompt = (
+                f"{_channel_prompt}\n\n{_directive}" if _channel_prompt else _directive
+            )
 
         msg_event = MessageEvent(
             text=text,

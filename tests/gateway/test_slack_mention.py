@@ -4,6 +4,7 @@ Tests for Slack mention gating (require_mention / free_response_channels).
 Follows the same pattern as test_whatsapp_group_gating.py.
 """
 
+import re
 import sys
 from unittest.mock import MagicMock
 
@@ -277,11 +278,12 @@ def test_free_response_channels_int_list():
 
 def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
                    text="hello", mentioned=False, thread_reply=False,
-                   active_session=False):
+                   active_session=False, in_mentioned_thread=False):
     """Simulate the mention gating logic from _handle_slack_message.
 
-    Returns True if the message would be processed, False if it would be
-    skipped (returned early).
+    Returns True if the message would be processed (enter the agent/LLM
+    lifecycle), False if it would be skipped or downgraded to a 👀 reaction
+    (returned early without responding).
     """
     bot_uid = adapter._team_bot_user_ids.get("T1", adapter._bot_user_id)
     if mentioned:
@@ -302,7 +304,14 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
         elif not adapter._slack_require_mention():
             return True
         elif not is_mentioned:
-            if thread_reply and active_session:
+            # Own-thread? (active session, or a thread we were mentioned in)
+            if (thread_reply and active_session) or in_mentioned_thread:
+                # Multi-actor guard: the thread is ours, but this message
+                # @-mentions a *different* actor (is_mentioned is already
+                # False), so the turn is addressed to them. React, don't
+                # respond. Mirrors the slack.py guard.
+                if re.search(r"<@[A-Z0-9]+>", text):
+                    return False
                 return True
             else:
                 return False
@@ -359,6 +368,48 @@ def test_thread_reply_without_active_session_ignored():
         adapter, text="followup",
         thread_reply=True, active_session=False,
     ) is False
+
+
+def test_mentioned_thread_followup_processed():
+    """Plain follow-up in a thread we were mentioned in → respond."""
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter, text="and what about friday?",
+        thread_reply=True, in_mentioned_thread=True,
+    ) is True
+
+
+def test_mentioned_thread_yields_when_other_actor_mentioned():
+    """Multi-actor guard (the ① #쿠키테스트 case).
+
+    The thread was opened by mentioning Hermes, so it lives in
+    _mentioned_threads. But a later message explicitly @-mentions
+    cookie.alter — that turn is addressed to alter, not Hermes. Hermes must
+    yield (react), not barge in.
+    """
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter, text="<@UALTER01> 이게 맞아 너는 이전 쓰레드에서 잘못 답했어",
+        thread_reply=True, in_mentioned_thread=True,
+    ) is False
+
+
+def test_active_session_thread_yields_when_other_actor_mentioned():
+    """Same guard via the active-session path, not just mentioned-thread."""
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter, text="<@UALTER01> can you take this one",
+        thread_reply=True, active_session=True,
+    ) is False
+
+
+def test_active_session_thread_responds_without_other_mention():
+    """Sanity: the guard does not suppress ordinary same-thread follow-ups."""
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter, text="ok go ahead",
+        thread_reply=True, active_session=True,
+    ) is True
 
 
 def test_bot_uid_none_processes_channel_message():
