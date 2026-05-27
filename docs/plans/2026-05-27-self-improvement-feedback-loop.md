@@ -1,6 +1,6 @@
 # 자가발전 피드백 루프 (owner-confirmed)
 
-작성: 2026-05-27 · 상태: 설계(쿠키 컨펌 대기) · 범위: hermes (`cookie/slack-parity`)
+작성: 2026-05-27 · 상태: **Phase 1 구현 완료** · 범위: hermes (`cookie/slack-parity`)
 
 ## 목표
 
@@ -78,3 +78,23 @@ non-owner(팀원/이사님)가 **봇 자신에 대한 피드백/개선요청**�
 - read-only 게이트: propose 경로만 non-owner 예외 허용
 
 **Phase 2:** 승인 시 owner 컨텍스트 재디스패치 실행 + audit + 미뤄둔 큐 리마인드/정렬.
+
+## Phase 1 구현 (2026-05-27 완료) — 메커니즘 (a) propose 도구
+
+선택: **(a) propose 도구 신설**. sentinel 후처리(b)는 병렬 세션 영역 충돌 위험 + base.py 손봄이라 보류.
+
+- `tools/self_improvement_tool.py` — `propose_self_improvement(feedback, plan, summary?)` 도구.
+  - 세션 컨텍스트(`gateway.session_context`)에서 actor/platform/channel/thread 읽음.
+  - `gateway.people_priority.feedback_priority(actor)` 로 tier/label/urgent 도출.
+  - owner = `HERMES_OWNER_IDS` 첫 id (하드코딩 X). Slack 봇 토큰은 gateway config.
+  - 쿠키 DM 으로 Block Kit 카드 전송: raw Slack Web API(aiohttp `conversations.open` + `chat.postMessage`) — `send_message_tool._send_slack` 와 동일한 loop-safe 패턴. live adapter 의존 X.
+  - 카드 버튼은 기존 `hermes_owner_confirm_approve`/`_cancel` action_id 재사용 → 게이트웨이 핸들러가 그대로 처리. proposal 은 게이트웨이와 **동일한** `OwnerConfirmStore` JSONL(`HERMES_OWNER_CONFIRM_AUDIT_PATH` or `~/.hermes/audit/owner-confirm.jsonl`)에 기록.
+  - **thread_ts = 카드 ts** 로 앵커(post→propose 순서) → 버튼/인-스레드 fallback 텍스트 둘 다 매칭. (root DM 메시지의 thread_ts 미스매치 회피.)
+  - 전송 실패해도(소유자 미설정/토큰 없음/DM 실패) proposal 은 저장 → 나중에 승인 가능. silent fail 금지([[feedback_no_silent_fail_on_permission]]).
+- `gateway/owner_confirm.py` — confirm verb `반영` + action_class `self_improvement` 추가.
+- `gateway/platforms/slack.py` `_handle_owner_confirm_message` — 승인된 proposal 이 `self_improvement` 이고 in-process executor 없으면 **`~/.hermes/state/self-improvement-queue.jsonl` 에 적재** + "승인됨/큐 적재" 응답 (NO_EXECUTOR 실패 대신). 자동 재디스패치는 Phase 2.
+- `toolsets.py` `_HERMES_CORE_TOOLS` 에 도구 등록 (CLI+모든 플랫폼). read-only 게이트 자동 통과(쓰기 도구 아님, mcp_ 아님).
+- `agent/agent_init.py` non-owner `_readonly_note` 에 EXCEPTION 절 추가 — 봇 자신에 대한 피드백이면 거절·owner멘션 말고 `propose_self_improvement` 호출 후 따뜻하게 감사.
+- 테스트: `tests/tools/test_self_improvement_tool.py` (5 — proposal 기록/degradation/큐/tier/승인 통합), `tests/gateway/test_owner_confirm.py`(10) + `test_slack.py`(210) 회귀 통과.
+
+게스트-facing ack 문구는 모델이 `guest_ack_hint` 받아 생성. 승인 UX 메커니즘은 게스트에 비노출.

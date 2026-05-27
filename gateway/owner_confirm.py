@@ -25,9 +25,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 _CONFIRM_RE = re.compile(
-    r"^\s*승인\s*:\s*(전송|수정|생성|삭제|commit)\s+#([A-Fa-f0-9]{4,8})\s*$"
+    r"^\s*승인\s*:\s*(전송|수정|생성|삭제|반영|commit)\s+#([A-Fa-f0-9]{4,8})\s*$"
 )
-_ALLOWED_CONFIRM_VERBS = {"전송", "수정", "생성", "삭제", "commit"}
+# "반영" (apply/adopt) is the verb for self-improvement proposals raised by the
+# feedback loop — see docs/plans/2026-05-27-self-improvement-feedback-loop.md.
+_ALLOWED_CONFIRM_VERBS = {"전송", "수정", "생성", "삭제", "반영", "commit"}
 _DEFAULT_TOKEN_TTL_SEC = 600
 
 
@@ -341,6 +343,9 @@ _CONFIRM_CLASSES = {
     "issue_create",
     "db_update",
     "notion_update",
+    # Self-improvement proposals from the non-owner feedback loop: a non-owner's
+    # feedback about the bot is turned into a plan that only the owner may adopt.
+    "self_improvement",
 }
 
 
