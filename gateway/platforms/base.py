@@ -3701,6 +3701,29 @@ class BasePlatformAdapter(ABC):
         lowered = error.lower()
         return "timed out" in lowered or "readtimeout" in lowered or "writetimeout" in lowered
 
+    # Sentinel the agent emits when it judges a message needs no reply.
+    # Mirrors gateway/platforms/feishu_comment.py — delivery is suppressed and
+    # platforms may acknowledge instead (see _ack_no_reply).
+    _NO_REPLY_SENTINEL = "NO_REPLY"
+
+    def _is_no_reply(self, text: Any) -> bool:
+        """True when the agent response is the NO_REPLY sentinel.
+
+        Matched at the start (after stripping) so a bare ``NO_REPLY`` — the
+        only form the directive asks for — is caught without false-positiving
+        on prose that merely mentions the word.
+        """
+        return isinstance(text, str) and text.strip().startswith(self._NO_REPLY_SENTINEL)
+
+    async def _ack_no_reply(self, event: "MessageEvent") -> None:
+        """Platform hook: acknowledge a suppressed NO_REPLY response.
+
+        Default no-op. Platforms may override to leave a lightweight signal
+        (Slack adds a 👀 reaction) so the user sees the message was read and
+        intentionally not answered, rather than silently dropped.
+        """
+        return
+
     def _unwrap_ephemeral(self, response: Any) -> Tuple[Optional[str], int]:
         """Unwrap a handler response into (text, ttl_seconds).
 
@@ -4502,6 +4525,18 @@ class BasePlatformAdapter(ABC):
             # string, and remember the TTL + platform capability so the
             # post-send block can schedule the deletion.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
+
+            # NO_REPLY: the agent judged this message needs no reply (e.g. an
+            # un-addressed remark in an active thread — small talk, an aside to
+            # someone else, something already handled). Suppress delivery and
+            # let the platform acknowledge instead (Slack: 👀). Author-agnostic:
+            # the decision is semantic and made by the model, not by who spoke.
+            if self._is_no_reply(response):
+                logger.debug(
+                    "[%s] Agent returned NO_REPLY — acking without a reply", self.name
+                )
+                await self._ack_no_reply(event)
+                response = None
 
             # Send response if any.  A None/empty response is normal when
             # streaming already delivered the text (already_sent=True) or
