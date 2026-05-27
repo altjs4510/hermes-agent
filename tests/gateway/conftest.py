@@ -332,6 +332,31 @@ _ensure_discord_mock()
 
 
 # ---------------------------------------------------------------------------
+# SLACK_* env-var leak guard
+# ---------------------------------------------------------------------------
+# ``gateway.config.load_gateway_config()`` bridges ``slack:`` config keys into
+# ``os.environ`` as a process-global side effect (SLACK_REQUIRE_MENTION,
+# SLACK_STRICT_MENTION, SLACK_ALLOW_BOTS, SLACK_FREE_RESPONSE_CHANNELS,
+# SLACK_REACTIONS, SLACK_ALLOWED_CHANNELS). The config-bridge tests in
+# test_slack_mention.py manage only a subset of these via ``monkeypatch``; the
+# rest leak forward and silently flip Slack mention-gating defaults for later
+# modules — e.g. a leaked ``SLACK_REQUIRE_MENTION=false`` makes test_slack.py
+# process channel messages without a mention, failing ~11 gating tests whenever
+# test_slack_mention.py is collected first. Snapshot/restore around every test
+# keeps the bridge's side effect contained, independent of collection order.
+@pytest.fixture(autouse=True)
+def _isolate_slack_env_bridge():
+    import os
+
+    saved = {k: v for k, v in os.environ.items() if k.startswith("SLACK_")}
+    yield
+    for k in [k for k in os.environ if k.startswith("SLACK_")]:
+        if k not in saved:
+            del os.environ[k]
+    os.environ.update(saved)
+
+
+# ---------------------------------------------------------------------------
 # Plugin-adapter anti-pattern guard
 # ---------------------------------------------------------------------------
 

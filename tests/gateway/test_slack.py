@@ -3352,6 +3352,74 @@ class TestThreadReplyHandling:
         assert msg_event.text == "Follow-up question"
 
     @pytest.mark.asyncio
+    async def test_unaddressed_thread_message_carries_no_reply_directive(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """An un-addressed message reaching us via session/thread membership
+        gets the NO_REPLY directive so the agent can stay quiet on small talk."""
+        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        mock_session_store._entries = {session_key: MagicMock()}
+
+        event = {
+            "text": "안녕하세요 다들",  # no @mention of anyone
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_called_once()
+        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
+        assert "NO_REPLY" in (msg_event.channel_prompt or "")
+
+    @pytest.mark.asyncio
+    async def test_directly_mentioned_message_has_no_no_reply_directive(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """A direct @mention must always answer — never carry NO_REPLY."""
+        event = {
+            "text": "<@U_BOT> what's the status?",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_called_once()
+        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
+        assert "NO_REPLY" not in (msg_event.channel_prompt or "")
+
+    def test_is_no_reply_sentinel_detection(self, adapter_with_session_store):
+        a = adapter_with_session_store
+        assert a._is_no_reply("NO_REPLY") is True
+        assert a._is_no_reply("NO_REPLY\n") is True
+        assert a._is_no_reply("  NO_REPLY  ") is True
+        assert a._is_no_reply("Sure — here's the summary") is False
+        assert a._is_no_reply("") is False
+        assert a._is_no_reply(None) is False
+
+    @pytest.mark.asyncio
+    async def test_ack_no_reply_reacts_with_eyes(self, adapter_with_session_store):
+        """NO_REPLY suppression leaves a 👀 so the message isn't silently dropped."""
+        a = adapter_with_session_store
+        a._app.client.reactions_add = AsyncMock()
+        ev = MagicMock()
+        ev.source.chat_id = "C123"
+        ev.message_id = "123.456"
+
+        await a._ack_no_reply(ev)
+
+        a._app.client.reactions_add.assert_awaited_once_with(
+            channel="C123", timestamp="123.456", name="eyes"
+        )
+
+    @pytest.mark.asyncio
     async def test_alter_thread_heuristic_reacts_in_multi_human_thread(
         self, adapter_with_session_store, mock_session_store
     ):
@@ -3417,16 +3485,21 @@ class TestThreadReplyHandling:
         assert adapter_with_session_store._app.client.conversations_replies.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_thread_reply_mentioning_other_bot_in_active_thread_responds(
+    async def test_human_mentioning_other_bot_in_active_thread_yields(
         self, adapter_with_session_store, mock_session_store
     ):
-        """Bot-to-bot work parity: active threads may continue even when another bot is addressed."""
+        """Multi-actor yield (the ① #쿠키테스트 case).
+
+        A human explicitly @-mentioning another bot in our active thread is
+        redirecting the turn to that actor — Hermes must yield with 👀 rather
+        than barge in. This intentionally overrides the earlier bot-to-bot
+        "active threads continue even when another bot is addressed" behavior
+        for *human-authored* messages. (Bot-authored continuation is preserved
+        in test_bot_authored_thread_reply_in_active_thread_responds_when_allowed.)
+        """
         session_key = "agent:main:slack:group:C123:123.000:U_USER"
         mock_session_store._entries = {session_key: MagicMock()}
         adapter_with_session_store._mentioned_threads.add("123.000")
-        adapter_with_session_store._app.client.users_info = AsyncMock(return_value={
-            "user": {"is_bot": True, "is_app_user": True, "profile": {"display_name": "cookie.alter"}}
-        })
         adapter_with_session_store._app.client.reactions_add = AsyncMock()
 
         event = {
@@ -3441,10 +3514,8 @@ class TestThreadReplyHandling:
 
         await adapter_with_session_store._handle_slack_message(event)
 
-        adapter_with_session_store.handle_message.assert_called_once()
-        adapter_with_session_store._app.client.reactions_add.assert_not_called()
-        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
-        assert msg_event.text == "<@UOTHERBOT> can you handle this?"
+        adapter_with_session_store.handle_message.assert_not_called()
+        adapter_with_session_store._app.client.reactions_add.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_bot_authored_thread_reply_in_active_thread_responds_when_allowed(
