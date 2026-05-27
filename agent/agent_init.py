@@ -978,7 +978,120 @@ def init_agent(
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
-    
+
+    # Non-owner read-only gate (gateway sessions only).
+    #
+    # When the requesting user is NOT the owner, drop side-effecting tools so a
+    # non-owner can look things up and answer, but cannot mutate the owner's
+    # machine (file writes, shell, code exec), act as the bot (send_message,
+    # platform admin), spend on generation, or touch the owner's personal stores
+    # (memory/todo). Read tools stay — including read_file/search_files (so
+    # "read yes, write no" within the file toolset) and MCP read tools.
+    #
+    # Owner identity comes from HERMES_OWNER_IDS (comma-separated platform user
+    # IDs). When it's unset, or there's no user (CLI/local agent has
+    # _user_id=None), no filtering applies — fully backward compatible.
+    #
+    # Two layers, because a bare name denylist alone leaves a hole: MCP tools
+    # are named ``mcp_<server>_<verb>...`` and a NEW MCP server adds write tools
+    # the static list can't know about. (Observed live: a non-owner's calendar
+    # request reached ``mcp_ms365_mcp_create_calendar_event`` — it only failed
+    # because that MCP happened to be down.) So we also block any ``mcp_*`` tool
+    # whose name carries a write verb segment (create/update/delete/send/...),
+    # while keeping mcp_* reads (search/list/get/...) so the bot stays useful.
+    _owner_ids = {u.strip() for u in os.getenv("HERMES_OWNER_IDS", "").split(",") if u.strip()}
+    if agent.tools and getattr(agent, "_user_id", None) and _owner_ids and agent._user_id not in _owner_ids:
+        _NON_OWNER_BLOCKED_TOOLS = {
+            # filesystem writes (read_file / search_files stay)
+            "write_file", "patch",
+            # shell / process / code execution
+            "terminal", "process", "execute_code", "computer_use",
+            # acting as the bot / spawning work
+            "send_message", "cronjob", "delegate_task",
+            # browser actions (read-only snapshots are useless without navigation)
+            "browser_navigate", "browser_click", "browser_type", "browser_scroll",
+            "browser_back", "browser_press", "browser_cdp", "browser_dialog",
+            # generation (cost + artifacts)
+            "image_generate", "video_generate", "text_to_speech",
+            # owner's personal stores (single tools that mix read/write → drop whole)
+            "memory", "todo", "skill_manage",
+            # platform admin / external sends
+            "discord", "discord_admin", "ha_call_service",
+            "spotify_playback", "spotify_queue",
+            "feishu_drive_reply_comment", "feishu_drive_add_comment",
+            "yb_send_dm", "yb_send_sticker",
+            # kanban mutations (kanban_show / kanban_list stay for read)
+            "kanban_create", "kanban_complete", "kanban_block", "kanban_unblock",
+            "kanban_comment", "kanban_link", "kanban_heartbeat",
+        }
+        # Write-verb segments used to catch mutating MCP tools by name shape.
+        _MCP_WRITE_VERBS = {
+            "create", "update", "delete", "send", "post", "add", "remove",
+            "write", "set", "move", "upload", "restore", "archive", "invite",
+            "reply", "edit", "patch", "rename", "cancel", "approve", "submit",
+        }
+
+        def _blocked_for_non_owner(name: str) -> bool:
+            if name in _NON_OWNER_BLOCKED_TOOLS:
+                return True
+            low = name.lower()
+            if low.startswith("mcp") and (set(low.split("_")) & _MCP_WRITE_VERBS):
+                return True  # mutating MCP tool (mcp_<server>_create_... etc.)
+            return False
+
+        _before = len(agent.tools)
+        _dropped = sorted(
+            t.get("function", {}).get("name", "")
+            for t in agent.tools
+            if _blocked_for_non_owner(t.get("function", {}).get("name", ""))
+        )
+        agent.tools = [
+            t for t in agent.tools
+            if not _blocked_for_non_owner(t.get("function", {}).get("name", ""))
+        ]
+        if _dropped:
+            # Always log (gateway agents run quiet_mode=True, so a print would be
+            # swallowed — this is the only signal the read-only gate fired).
+            logger.info(
+                "Non-owner read-only gate: user=%s dropped %d side-effecting tool(s): %s",
+                agent._user_id, len(_dropped), ", ".join(_dropped),
+            )
+
+        # Self-awareness note so the model declines write requests cleanly
+        # instead of confabulating reasons (MCP down / guest perms) or handing
+        # the user owner-only operator commands like `hermes gateway restart`.
+        # Critical instructions are in English so they survive the rare ASCII-
+        # locale fallback that strips non-ASCII from the system prompt
+        # (conversation_loop _strip_non_ascii, only on LANG=C-style encoding
+        # errors). The Korean example below is a nice-to-have under normal UTF-8.
+        #
+        # The owner mention (Slack/Discord <@id> form) lets the model pull the
+        # owner into the thread on a write request — it needs no tool, it's just
+        # text in the reply that the platform renders as a ping.
+        _owner_mention = " ".join(f"<@{oid}>" for oid in sorted(_owner_ids))
+        _readonly_note = (
+            "ACCESS CONTEXT: The person you are talking to is NOT the owner. Write "
+            "actions are restricted to the owner BY ACCESS POLICY — tools that write "
+            "files, run shell/code, send messages, schedule jobs, or modify any external "
+            "system (calendar, Notion, Teams, kanban, etc.) are intentionally withheld "
+            "from non-owners. This is a permission boundary, NOT a missing capability: "
+            "you are fully capable, you are simply not authorized to make changes for "
+            "non-owners. "
+            "If they ask for an action that changes anything: do NOT attempt it, do NOT "
+            "imply you are unable / broken / lacking the feature, do NOT invent a "
+            "technical excuse ('MCP disconnected', 'guest permissions'), and do NOT hand "
+            "them operator commands ('hermes gateway restart') or tell them to ask "
+            "someone to run them. Instead, briefly in Korean: explain that changes can "
+            "only be made by the owner 쿠키, and @-mention the owner so they are looped in "
+            f"— include this exact mention in your reply: {_owner_mention} . "
+            "(e.g. \"이건 변경 작업이라 쿠키만 할 수 있어요. " + _owner_mention + " 확인 부탁드려요!\") "
+            "You CAN still read, look things up, and answer freely."
+        )
+        agent.ephemeral_system_prompt = (
+            (agent.ephemeral_system_prompt + "\n\n" + _readonly_note).strip()
+            if agent.ephemeral_system_prompt else _readonly_note
+        )
+
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
     if agent.tools:
