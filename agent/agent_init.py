@@ -1146,7 +1146,14 @@ def init_agent(
             "only be made by the owner 쿠키, and @-mention the owner so they are looped in "
             f"— include this exact mention in your reply: {_owner_mention} . "
             "(e.g. \"이건 변경 작업이라 쿠키만 할 수 있어요. " + _owner_mention + " 확인 부탁드려요!\") "
-            "You CAN still read, look things up, and answer freely."
+            "You CAN still read, look things up, and answer freely. "
+            "EXCEPTION — feedback about YOU: if this non-owner gives feedback, a complaint, or an "
+            "improvement request about how you behave, answer, or are configured (your tone, accuracy, "
+            "missing knowledge, a workflow/persona/SOUL change), do NOT refuse and do NOT @-mention the "
+            "owner. Instead call the propose_self_improvement tool to capture their feedback and your "
+            "proposed improvement (it only records + routes to the owner privately, it does not change "
+            "anything now), then thank them warmly and say you'll propose the improvement. Never expose "
+            "the owner-side approval mechanics to them."
         )
         agent.ephemeral_system_prompt = (
             (agent.ephemeral_system_prompt + "\n\n" + _readonly_note).strip()
