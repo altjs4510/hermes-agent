@@ -3233,6 +3233,30 @@ class TestThreadReplyHandling:
         )
 
     @pytest.mark.asyncio
+    async def test_ack_no_reply_reacts_with_agent_chosen_emoji(self, adapter_with_session_store):
+        """The agent-picked emoji name is used for the reaction."""
+        a = adapter_with_session_store
+        a._app.client.reactions_add = AsyncMock()
+        ev = MagicMock()
+        ev.source.chat_id = "C123"
+        ev.message_id = "123.456"
+
+        await a._ack_no_reply(ev, "wave")
+
+        a._app.client.reactions_add.assert_awaited_once_with(
+            channel="C123", timestamp="123.456", name="wave"
+        )
+
+    def test_parse_no_reply_emoji(self, adapter_with_session_store):
+        a = adapter_with_session_store
+        assert a._parse_no_reply_emoji("NO_REPLY wave") == "wave"
+        assert a._parse_no_reply_emoji("NO_REPLY +1") == "+1"
+        assert a._parse_no_reply_emoji("NO_REPLY :tada:") == "tada"
+        assert a._parse_no_reply_emoji("NO_REPLY") == "eyes"  # bare → default
+        assert a._parse_no_reply_emoji("NO_REPLY made_up_emoji") == "eyes"  # off-list → default
+        assert a._parse_no_reply_emoji(None) == "eyes"
+
+    @pytest.mark.asyncio
     async def test_alter_thread_heuristic_reacts_in_multi_human_thread(
         self, adapter_with_session_store, mock_session_store
     ):
