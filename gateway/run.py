@@ -15248,6 +15248,216 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     # ------------------------------------------------------------------
 
+    def _claude_p_first_enabled(self, source: "SessionSource") -> bool:
+        """Return True when Slack should try Claude Code print mode before Hermes.
+
+        This is a Cookie-local escape hatch for Team-plan Claude Code: direct
+        Anthropic OAuth credentials count as third-party usage, but the local
+        `claude -p` CLI works.  If the CLI path fails, `_run_agent()` falls
+        through to the normal Hermes provider path (currently Codex).
+        """
+        if source.platform != Platform.SLACK:
+            return False
+        raw = os.getenv("HERMES_SLACK_CLAUDE_P_FIRST", "").strip()
+        if raw:
+            return is_truthy_value(raw, default=False)
+        cfg = _load_gateway_config()
+        gateway_cfg = cfg.get("gateway") or {}
+        return is_truthy_value(gateway_cfg.get("slack_claude_p_first"), default=False)
+
+    def _claude_p_prompt(
+        self,
+        *,
+        message: str,
+        context_prompt: str,
+        history: List[Dict[str, Any]],
+        source: "SessionSource",
+        channel_prompt: Optional[str] = None,
+    ) -> str:
+        """Build a compact prompt for `claude -p` fallback lane."""
+        parts: List[str] = [
+            "You are cookie.hermes, Cookie's Slack alter.",
+            "Answer in Korean by default. Be concise: conclusion / action / next step.",
+            "Do not say you will do future work unless you actually did it.",
+            "Local file/code edits are OK when requested; external/shared side effects like git push, Slack sends, Notion writes, or credential changes require explicit approval.",
+        ]
+        if context_prompt:
+            parts.append("\n[Gateway context]\n" + context_prompt.strip())
+        if channel_prompt:
+            parts.append("\n[Channel context]\n" + channel_prompt.strip())
+        if source.chat_name or source.chat_type:
+            parts.append(
+                f"\n[Slack surface]\nchat={source.chat_name or source.chat_id} type={source.chat_type or ''} thread={source.thread_id or ''}"
+            )
+        compact_history: List[str] = []
+        for msg in (history or [])[-12:]:
+            role = msg.get("role")
+            content = str(msg.get("content") or "").strip()
+            if role in {"user", "assistant"} and content:
+                if len(content) > 1200:
+                    content = content[:1197] + "..."
+                compact_history.append(f"{role}: {content}")
+        if compact_history:
+            parts.append("\n[Recent conversation]\n" + "\n".join(compact_history))
+        parts.append("\n[User message]\n" + (message or "").strip())
+        return "\n".join(parts)
+
+    async def _run_agent_via_claude_p(
+        self,
+        *,
+        message: str,
+        context_prompt: str,
+        history: List[Dict[str, Any]],
+        source: "SessionSource",
+        session_id: str,
+        session_key: Optional[str] = None,
+        run_generation: Optional[int] = None,
+        channel_prompt: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Try Claude Code print mode. Return None to fall back to Hermes."""
+        if not self._claude_p_first_enabled(source):
+            return None
+        if not str(message or "").strip() or str(message or "").lstrip().startswith("/"):
+            return None
+
+        def _run_still_current() -> bool:
+            if run_generation is None or not session_key:
+                return True
+            return self._is_session_run_current(session_key, run_generation)
+
+        timeout = float(os.getenv("HERMES_SLACK_CLAUDE_P_TIMEOUT", "120") or 120)
+        max_turns = os.getenv("HERMES_SLACK_CLAUDE_P_MAX_TURNS", "8").strip() or "8"
+        model = os.getenv("HERMES_SLACK_CLAUDE_P_MODEL", "sonnet").strip() or "sonnet"
+        cwd = (
+            os.getenv("HERMES_SLACK_CLAUDE_P_CWD", "").strip()
+            or os.getenv("TERMINAL_CWD", "").strip()
+            or "/Users/ac1158/workspace/cookie-jarvis"
+        )
+        prompt = self._claude_p_prompt(
+            message=message,
+            context_prompt=context_prompt,
+            history=history,
+            source=source,
+            channel_prompt=channel_prompt,
+        )
+        cmd = [
+            "claude",
+            "-p",
+            prompt,
+            "--output-format",
+            "json",
+            "--max-turns",
+            str(max_turns),
+            "--model",
+            model,
+            "--fallback-model",
+            "haiku",
+            "--disallowedTools",
+            "Bash(git push*),Bash(gh pr merge*),Bash(curl *|sh*),Bash(rm -rf *)",
+        ]
+        logger.info(
+            "Slack claude-p-first: starting session=%s cwd=%s timeout=%ss",
+            session_key or session_id,
+            cwd,
+            timeout,
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=cwd if os.path.isdir(cwd) else None,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+                logger.warning("Slack claude-p-first timed out after %ss; falling back", timeout)
+                return None
+        except Exception as exc:
+            logger.warning("Slack claude-p-first failed to spawn; falling back: %s", exc)
+            return None
+
+        if not _run_still_current():
+            return {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+                "history_offset": len(history),
+                "session_id": session_id,
+                "response_previewed": False,
+            }
+
+        stdout = stdout_b.decode("utf-8", errors="replace").strip()
+        stderr = stderr_b.decode("utf-8", errors="replace").strip()
+        if proc.returncode != 0:
+            logger.warning(
+                "Slack claude-p-first exited rc=%s stderr=%s; falling back",
+                proc.returncode,
+                _redact_gateway_user_facing_secrets(stderr)[:500],
+            )
+            return None
+
+        final_response = ""
+        try:
+            obj = json.loads(stdout)
+            final_response = str(obj.get("result") or obj.get("content") or "").strip()
+            subtype = str(obj.get("subtype") or "")
+            if subtype and subtype != "success":
+                logger.warning("Slack claude-p-first subtype=%s; falling back", subtype)
+                return None
+        except Exception:
+            # Some local hooks/plugins can print a banner before the JSON.  Use the
+            # last JSON-looking line if present, otherwise raw stdout.
+            for line in reversed(stdout.splitlines()):
+                line = line.strip()
+                if line.startswith("{") and line.endswith("}"):
+                    try:
+                        obj = json.loads(line)
+                        final_response = str(obj.get("result") or obj.get("content") or "").strip()
+                        break
+                    except Exception:
+                        pass
+            if not final_response:
+                final_response = stdout.strip()
+
+        if not final_response:
+            logger.warning("Slack claude-p-first returned empty output; falling back")
+            return None
+
+        final_lines = [
+            line for line in final_response.splitlines()
+            if line.strip() != "[F&F Policy Active]"
+        ]
+        final_response = "\n".join(final_lines).strip()
+        if not final_response:
+            logger.warning("Slack claude-p-first returned only local policy banner; falling back")
+            return None
+
+        logger.info(
+            "Slack claude-p-first succeeded session=%s response=%d chars",
+            session_key or session_id,
+            len(final_response),
+        )
+        return {
+            "final_response": final_response,
+            "messages": [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": final_response},
+            ],
+            "api_calls": 1,
+            "tools": [],
+            "history_offset": len(history),
+            "session_id": session_id,
+            "model": "claude-p",
+            "response_previewed": False,
+        }
+
     async def _run_agent(
         self,
         message: str,
@@ -15255,7 +15465,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         history: List[Dict[str, Any]],
         source: SessionSource,
         session_id: str,
-        session_key: str = None,
+        session_key: str = "",
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
@@ -15337,6 +15547,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        # Cookie-local fast lane: Slack first tries Claude Code CLI (`claude -p`).
+        # If it times out, errors, or returns empty, continue into the normal
+        # Hermes provider path (Codex) below.
+        claude_p_result = await self._run_agent_via_claude_p(
+            message=message,
+            context_prompt=context_prompt,
+            history=history,
+            source=source,
+            session_id=session_id,
+            session_key=session_key,
+            run_generation=run_generation,
+            channel_prompt=channel_prompt,
+        )
+        if claude_p_result is not None:
+            return claude_p_result
+
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
@@ -15401,11 +15627,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and platform_key in _legacy_tp_overrides
             )
         )
-        progress_mode = (
-            _env_tp
-            if _env_tp and not _tool_progress_configured
-            else (_resolved_tp or _env_tp or "all")
-        )
+        if _resolved_tp is False:
+            progress_mode = "off"
+        else:
+            progress_mode = (
+                _env_tp
+                if _env_tp and not _tool_progress_configured
+                else (_resolved_tp or _env_tp or "all")
+            )
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
         # Disable tool progress for webhooks - they don't support message editing,
