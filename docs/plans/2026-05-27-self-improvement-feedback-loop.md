@@ -1,6 +1,6 @@
 # 자가발전 피드백 루프 (owner-confirmed)
 
-작성: 2026-05-27 · 상태: **Phase 1 구현 완료** · 범위: hermes (`cookie/slack-parity`)
+작성: 2026-05-27 · 상태: **Phase 1+2 구현 완료** · 범위: hermes (`cookie/slack-parity`)
 
 ## 목표
 
@@ -98,3 +98,25 @@ non-owner(팀원/이사님)가 **봇 자신에 대한 피드백/개선요청**�
 - 테스트: `tests/tools/test_self_improvement_tool.py` (5 — proposal 기록/degradation/큐/tier/승인 통합), `tests/gateway/test_owner_confirm.py`(10) + `test_slack.py`(210) 회귀 통과.
 
 게스트-facing ack 문구는 모델이 `guest_ack_hint` 받아 생성. 승인 UX 메커니즘은 게스트에 비노출.
+
+## Phase 2 구현 (2026-05-27 완료) — 재디스패치 실행(옵션2) + 주간 리마인드
+
+실행 모델 결정(쿠키): **옵션 2 — 즉시 실행 + 변경 이중게이트**. 승인 시 owner 컨텍스트로 plan을
+즉시 재디스패치하되, 실제 파일/설정/SOUL 변경은 한 번 더 owner 컨펌을 받게 한다 (프롬프트 레벨 게이트).
+
+- **본문 사이드카** (`tools/self_improvement_tool.py`) — owner-confirm 스토어는 ref만 보관하므로,
+  제안 생성 시 `~/.hermes/state/self-improvement-proposals/{id}.json` 에 full {feedback, plan, summary,
+  provider_label, tier, actor, owner, target_ref} 저장. `load_proposal_body()` 로 복원. 전송 실패해도 저장.
+- **승인 → owner 컨텍스트 재디스패치** (`gateway/platforms/slack.py::_dispatch_self_improvement_execution`) —
+  승인(QUEUED_P1) 직후 synthetic `MessageEvent(internal=True, source=owner DM, user_id=owner)` 를
+  `runner._handle_message` 로 발사(fire-and-forget). user_id=owner 라 non-owner 게이트 우회 → write 가능.
+  프롬프트(`build_execution_prompt`)는 "자가발전 실행 모드" — 변경 적용 *직전* 변경 요약+컨펌을 owner에게
+  받도록 규칙 주입(이중게이트). 결과/컨펌 요청은 같은 DM 스레드(카드 thread_ts)에 착지. 실패는 로그만, 승인 경로 비차단.
+- **주간 cron 리마인드** (`setup_reminder_cron`) — 미처리(latest state=`proposed`) 제안을 우선순위(executive→PRCS→기타)·
+  오래된 순으로 요약(`pending_summary`). 결정적 `no_agent` 스크립트(`~/.hermes/scripts/self_improvement_digest.py`,
+  editable 패키지 import)를 주 1회(월 09:00, `0 9 * * 1`) 실행해 owner DM(`deliver=origin`)으로 전달. 백로그 없으면 무소음("").
+  멱등 — 이름으로 기존 job 확인.
+- 테스트: `tests/tools/test_self_improvement_tool.py` 10건(본문 사이드카, 실행 프롬프트 이중게이트, pending_summary
+  정렬/무소음, 리마인드 cron 멱등/owner없음 스킵, 승인 통합) + slack/owner_confirm 회귀 통과.
+
+남은 것(Phase 3 후보): 변경 이중게이트의 *결정적* 강제(owner 세션 write 후킹), stale 90일 자동 정리.

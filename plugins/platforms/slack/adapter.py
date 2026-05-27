@@ -2793,6 +2793,71 @@ class SlackAdapter(BasePlatformAdapter):
             thread_ts=thread_ts,
         )
 
+    def _dispatch_self_improvement_execution(self, proposed: Dict[str, Any]) -> None:
+        """Phase 2 — re-dispatch an approved self-improvement plan as the owner.
+
+        Builds a synthetic internal MessageEvent whose source is the owner's DM
+        (user_id = owner → owner privileges, write-capable) carrying the
+        execution-mode prompt (feedback + approved plan + change double-gate
+        rules), and runs it through the normal gateway pipeline so the agent
+        performs the work and replies in the same DM thread. Fire-and-forget:
+        failures are logged, never raised into the approval path.
+
+        See docs/plans/2026-05-27-self-improvement-feedback-loop.md (Phase 2).
+        """
+        proposal_id = str(proposed.get("proposal_id") or "")
+        owner = str(proposed.get("owner") or "")
+        dm_channel = str(proposed.get("channel") or "")
+        thread_ts = str(proposed.get("thread_ts") or "") or None
+        if not (proposal_id and owner and dm_channel):
+            logger.warning("self_improvement exec: missing owner/channel for %s", proposal_id)
+            return
+
+        try:
+            from tools.self_improvement_tool import build_execution_prompt, load_proposal_body
+        except Exception as exc:  # pragma: no cover - import guard
+            logger.warning("self_improvement exec: import failed: %s", exc)
+            return
+        body = load_proposal_body(proposal_id)
+        if not body:
+            logger.warning("self_improvement exec: no saved body for %s; skipping", proposal_id)
+            return
+
+        try:
+            from gateway.platforms.base import MessageEvent
+            from gateway.run import _gateway_runner_ref
+            from gateway.session import SessionSource
+
+            runner = _gateway_runner_ref()
+            if runner is None:
+                logger.warning("self_improvement exec: no live gateway runner; skipping")
+                return
+
+            source = SessionSource(
+                platform=self.platform,
+                chat_id=dm_channel,
+                chat_type="dm",
+                user_id=owner,       # owner privileges (bypasses non-owner gate)
+                user_name="쿠키",
+                thread_id=thread_ts,
+            )
+            event = MessageEvent(
+                text=build_execution_prompt(body),
+                source=source,
+                internal=True,
+            )
+
+            async def _run() -> None:
+                try:
+                    await runner._handle_message(event)
+                except Exception as exc:
+                    logger.warning("self_improvement exec run failed for %s: %s", proposal_id, exc)
+
+            asyncio.create_task(_run())
+            logger.info("self_improvement exec: dispatched %s as owner in %s", proposal_id, dm_channel)
+        except Exception as exc:
+            logger.warning("self_improvement exec: dispatch setup failed for %s: %s", proposal_id, exc)
+
     async def _handle_owner_confirm_message(
         self,
         *,
@@ -2887,6 +2952,12 @@ class SlackAdapter(BasePlatformAdapter):
                 result_code=result_code,
             )
             await self._send_owner_confirm_reply(channel_id, thread_ts, reply_text)
+            if result_code == "QUEUED_P1":
+                # Phase 2: re-dispatch the approved plan as the owner (option 2 —
+                # immediate execution with a change double-gate enforced via the
+                # execution-mode prompt). Fire-and-forget so the approval returns
+                # fast; the agent's work + any change-confirm land in this DM.
+                self._dispatch_self_improvement_execution(proposed)
             return True
         if executor is None:
             executed = store.execute(
