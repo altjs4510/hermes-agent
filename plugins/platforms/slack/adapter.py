@@ -2107,11 +2107,12 @@ class SlackAdapter(BasePlatformAdapter):
             logger.debug("[Slack] reactions.add failed (%s): %s", emoji, e)
             return False
 
-    async def _ack_no_reply(self, event: "MessageEvent") -> None:
-        """React with 👀 when the agent chose not to reply (NO_REPLY).
+    async def _ack_no_reply(self, event: "MessageEvent", emoji: str = "eyes") -> None:
+        """React when the agent chose not to reply (NO_REPLY).
 
-        Mirrors the "seen but intentionally not answered" signal the gating
-        layer already uses for multi-actor yields, so a suppressed reply isn't
+        ``emoji`` is the agent-picked, pre-validated Slack emoji name (default
+        👀). Mirrors the "seen but intentionally not answered" signal the
+        gating layer uses for multi-actor yields, so a suppressed reply isn't
         silently dropped.
         """
         if not self._reactions_enabled():
@@ -2119,14 +2120,15 @@ class SlackAdapter(BasePlatformAdapter):
         channel = getattr(event.source, "chat_id", None)
         ts = event.message_id
         if channel and ts:
-            await self._add_reaction(channel, ts, "eyes")
+            await self._add_reaction(channel, ts, emoji)
 
     def _no_reply_thread_directive(self) -> str:
         """Ephemeral instruction appended for un-addressed thread messages.
 
         Tells the agent it is one of several thread participants and should
-        emit the NO_REPLY sentinel when a reply isn't warranted, instead of
-        answering just because the message reached it.
+        emit the NO_REPLY sentinel when a reply isn't warranted, optionally
+        choosing a fitting reaction emoji, instead of answering just because
+        the message reached it.
         """
         return (
             "You are one of several participants in this Slack thread (the user, "
@@ -2134,8 +2136,12 @@ class SlackAdapter(BasePlatformAdapter):
             "to you directly. Reply only if you can add something genuinely "
             "useful or were clearly expected to. If a reply is unnecessary — "
             "small talk, acknowledgements, remarks aimed at someone else, or "
-            "something already handled by another participant — output exactly "
-            "NO_REPLY and nothing else."
+            "something already handled by another participant — output NO_REPLY. "
+            "You may append one emoji name to react in a way that fits the "
+            "moment, e.g. 'NO_REPLY wave' to greet back, 'NO_REPLY +1' or "
+            "'NO_REPLY white_check_mark' to acknowledge, 'NO_REPLY tada' to "
+            "celebrate, 'NO_REPLY pray' to thank, 'NO_REPLY clap' for good work. "
+            "Plain 'NO_REPLY' leaves 👀. Use only one emoji name and nothing else."
         )
 
     async def _remove_reaction(

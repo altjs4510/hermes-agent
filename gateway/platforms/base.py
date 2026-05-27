@@ -3790,21 +3790,43 @@ class BasePlatformAdapter(ABC):
     # platforms may acknowledge instead (see _ack_no_reply).
     _NO_REPLY_SENTINEL = "NO_REPLY"
 
+    # Acknowledgement reactions the agent may pick after NO_REPLY (Slack emoji
+    # names). Constrained to a safe set so a hallucinated/invalid name can't
+    # break reactions.add; anything off-list falls back to 👀 (eyes).
+    _NO_REPLY_REACTIONS = frozenset({
+        "eyes", "wave", "+1", "white_check_mark", "tada", "pray",
+        "raised_hands", "ok_hand", "heart", "thinking_face", "clap", "100",
+        "rocket", "sparkles", "saluting_face", "thumbsup", "joy",
+    })
+
     def _is_no_reply(self, text: Any) -> bool:
         """True when the agent response is the NO_REPLY sentinel.
 
-        Matched at the start (after stripping) so a bare ``NO_REPLY`` — the
-        only form the directive asks for — is caught without false-positiving
-        on prose that merely mentions the word.
+        Matched at the start (after stripping) so a bare ``NO_REPLY`` — and the
+        ``NO_REPLY <emoji>`` form — is caught without false-positiving on prose
+        that merely mentions the word.
         """
         return isinstance(text, str) and text.strip().startswith(self._NO_REPLY_SENTINEL)
 
-    async def _ack_no_reply(self, event: "MessageEvent") -> None:
+    def _parse_no_reply_emoji(self, text: Any) -> str:
+        """Extract the acknowledgement emoji from a ``NO_REPLY [name]`` response.
+
+        The agent may append one emoji name to pick a context-appropriate
+        reaction (e.g. ``NO_REPLY wave`` for a greeting). Returns a validated
+        Slack emoji name, defaulting to ``eyes`` when none/invalid is given.
+        """
+        if not isinstance(text, str):
+            return "eyes"
+        rest = text.strip()[len(self._NO_REPLY_SENTINEL):].strip()
+        token = rest.split()[0].strip(":") if rest else ""
+        return token if token in self._NO_REPLY_REACTIONS else "eyes"
+
+    async def _ack_no_reply(self, event: "MessageEvent", emoji: str = "eyes") -> None:
         """Platform hook: acknowledge a suppressed NO_REPLY response.
 
         Default no-op. Platforms may override to leave a lightweight signal
-        (Slack adds a 👀 reaction) so the user sees the message was read and
-        intentionally not answered, rather than silently dropped.
+        (Slack adds an emoji reaction — ``emoji``, default 👀) so the user sees
+        the message was read and intentionally not answered, not dropped.
         """
         return
 
@@ -4629,10 +4651,12 @@ class BasePlatformAdapter(ABC):
             # let the platform acknowledge instead (Slack: 👀). Author-agnostic:
             # the decision is semantic and made by the model, not by who spoke.
             if self._is_no_reply(response):
+                _ack_emoji = self._parse_no_reply_emoji(response)
                 logger.debug(
-                    "[%s] Agent returned NO_REPLY — acking without a reply", self.name
+                    "[%s] Agent returned NO_REPLY — acking with :%s: without a reply",
+                    self.name, _ack_emoji,
                 )
-                await self._ack_no_reply(event)
+                await self._ack_no_reply(event, _ack_emoji)
                 response = None
 
             # Send response if any.  A None/empty response is normal when
