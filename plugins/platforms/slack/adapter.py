@@ -2841,6 +2841,10 @@ class SlackAdapter(BasePlatformAdapter):
                 user_name="쿠키",
                 thread_id=thread_ts,
             )
+            # internal=True: system-initiated turn (skips auth/pairing). The
+            # gateway suppresses its conversational delivery either way, so we
+            # capture the returned text in _run() and deliver it ourselves —
+            # internal=True avoids any double-send.
             event = MessageEvent(
                 text=build_execution_prompt(body),
                 source=source,
@@ -2858,7 +2862,15 @@ class SlackAdapter(BasePlatformAdapter):
                 # owner-confirm before any write_file/patch in this turn.
                 tok = set_self_improvement_exec(proposal_id)
                 try:
-                    await runner._handle_message(event)
+                    # The gateway suppresses conversational delivery for this
+                    # agent-initiated turn into a DM thread (response is built
+                    # but never sent — observed live). _handle_message still
+                    # RETURNS the final text, so we deliver it to the card
+                    # thread ourselves — deterministic, no reliance on the
+                    # gateway's reply-routing heuristics.
+                    resp = await runner._handle_message(event)
+                    if isinstance(resp, str) and resp.strip() and resp.strip() != "(empty)":
+                        await self._send_owner_confirm_reply(dm_channel, thread_ts or "", resp.strip())
                 except Exception as exc:
                     logger.warning("self_improvement exec run failed for %s: %s", proposal_id, exc)
                 finally:
