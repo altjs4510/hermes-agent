@@ -17854,6 +17854,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         first_response,
                         previewed=_previewed,
                     )
+                    # NO_REPLY suppression: base.py's _is_no_reply gate fires on
+                    # the FINAL returned response only. The queued-follow-up
+                    # branch here re-sends an intermediate first_response, so
+                    # without this check a "NO_REPLY" / "NO_REPLY eyes" string
+                    # would be delivered as raw text. Mirror the base.py path:
+                    # suppress the send and ack with the chosen reaction.
+                    if first_response and adapter and getattr(adapter, "_is_no_reply", None) and adapter._is_no_reply(first_response):
+                        _ack_emoji = adapter._parse_no_reply_emoji(first_response)
+                        logger.info(
+                            "Queued follow-up for session %s: first response was NO_REPLY — acking with :%s: instead of sending.",
+                            session_key or "?", _ack_emoji,
+                        )
+                        try:
+                            from types import SimpleNamespace
+                            _fake_event = SimpleNamespace(
+                                source=source,
+                                message_id=event_message_id,
+                            )
+                            await adapter._ack_no_reply(_fake_event, _ack_emoji)
+                        except Exception as e:
+                            logger.debug("NO_REPLY ack failed in queued-follow-up path: %s", e)
+                        first_response = ""
                     if first_response and not _already_streamed:
                         try:
                             logger.info(
