@@ -138,3 +138,15 @@ P2 라이브 테스트(이사님 피드백 승인 → 재디스패치)에서:
      exec 턴 밖에선 no-op(owner 일반 세션은 자유).
    - `model_tools.py` dispatch — ACP edit-approval 가드 옆에 호출. 게이트 오류 시 fail-safe(차단).
    - tone.md §8 변경은 합리적이라 유지(쿠키 결정).
+
+**라이브 재검증 2 (2026-05-28) — 응답 전달 버그 + 최종 성공:**
+- 증상: 재디스패치 턴은 돌고 에이전트가 응답을 만들지만(`response ready`), 게이트웨이가 그
+  대화 응답을 **전달하지 않고 억제**(`Sending response` 미출력) → 에이전트 제안/질문이 owner에게 안 닿음.
+  `internal=True/False` 무관하게 DM 스레드로의 agent-initiated 턴 응답이 일관 억제됨.
+- 수정: 게이트웨이 응답 라우팅에 의존하지 말고 `_run()` 에서 `_handle_message` **반환 텍스트를 받아
+  직접 카드 스레드에 전송**(`_send_owner_confirm_reply`). internal=True 유지(중복 전송 방지).
+- 최종 라이브 결과 ✅: 카드 승인 → 에이전트 변경 요약 전달 → 에이전트가 `terminal echo>>` 로 적용 시도 →
+  **게이트웨이 shell-command 가드가 민감경로(`~/.hermes/`) 감지해 승인 카드 → 쿠키 승인 → 적용**.
+- 게이트 2층 정리: (1) 내 `maybe_require_change_approval`(write_file/patch) + (2) 게이트웨이 command-guard
+  (terminal/민감경로). 자가발전 타깃은 전부 `~/.hermes/` 하위(민감경로)라 어느 도구로 고치든 한쪽이 잡음.
+  terminal 전체를 게이트하면 읽기에도 승인 피로 → 현 2층 조합 유지(확장 안 함).
