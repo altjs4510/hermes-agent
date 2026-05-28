@@ -119,7 +119,12 @@ non-owner(팀원/이사님)가 **봇 자신에 대한 피드백/개선요청**�
 - 테스트: `tests/tools/test_self_improvement_tool.py` 10건(본문 사이드카, 실행 프롬프트 이중게이트, pending_summary
   정렬/무소음, 리마인드 cron 멱등/owner없음 스킵, 승인 통합) + slack/owner_confirm 회귀 통과.
 
-남은 것(Phase 3 후보): stale 90일 자동 정리, 게이트 카드 UX 다듬기.
+**stale 자동 정리 (2026-05-28 완료)**: `cleanup_stale_proposals(max_age_days=90)` — 90일 이상
+`proposed` 로 방치된 제안을 `expire`(confirmed/executed 등은 무시). `setup_stale_cleanup_cron` 가
+월 1회(`0 9 1 * *`) no_agent 스크립트로 실행, 정리된 게 있을 때만 owner DM 1줄 통보(아니면 무소음).
+라이브 등록 완료(job `335686c86b34`).
+
+남은 것(Phase 3 후보): 게이트 카드 UX 다듬기.
 
 ### 라이브 검증 발견 + 후속 (2026-05-28)
 
