@@ -282,6 +282,60 @@ def test_change_gate_blocks_when_denied(monkeypatch):
     assert calls["pattern_key"] == "self_improvement:apply_change"
 
 
+def test_cleanup_stale_proposals(isolated_paths, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    store_path, _ = isolated_paths
+    from gateway.owner_confirm import OwnerConfirmStore
+    from tools.self_improvement_tool import cleanup_stale_proposals
+
+    store = OwnerConfirmStore(str(store_path))
+    now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+    old = now - timedelta(days=100)
+    fresh = now - timedelta(days=10)
+
+    def _mk(token, when):
+        return store.propose(
+            channel="D1", thread_ts=token, actor="U1", owner="UO",
+            action_class="self_improvement", confirm_verb="반영", token=token,
+            target_ref="r", preview_ref="p", risk_level="low", now=when,
+        )
+
+    stale = _mk("AAAA", old)       # 100d old, pending → should expire
+    recent = _mk("BBBB", fresh)    # 10d old, pending → keep
+    done = _mk("CCCC", old)        # old but confirmed → keep
+    store.confirm(proposal_id=done["proposal_id"], actor="UO", confirm_message_ts="m", now=old)
+
+    res = cleanup_stale_proposals(max_age_days=90, now=now)
+    assert res["expired"] == 1
+    assert stale["proposal_id"] in res["ids"]
+    assert recent["proposal_id"] not in res["ids"]
+    assert done["proposal_id"] not in res["ids"]
+
+    # the stale one is now in expired state
+    states = {e["state"] for e in store.lookup(stale["proposal_id"])}
+    assert "expired" in states
+
+
+def test_setup_stale_cleanup_cron(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_OWNER_IDS", "UOWNER")
+    import tools.self_improvement_tool as sit
+
+    created = {}
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda *a, **k: [])
+    monkeypatch.setattr("cron.jobs.create_job", lambda **kw: created.update(kw) or {"id": "job_s"})
+
+    res = sit.setup_stale_cleanup_cron(scripts_dir=tmp_path)
+    assert res["status"] == "created" and res["job_id"] == "job_s"
+    assert created["schedule"] == "0 9 1 * *"  # monthly
+    assert created["no_agent"] is True
+    script = (tmp_path / sit._STALE_SCRIPT_NAME).read_text(encoding="utf-8")
+    assert "cleanup_stale_proposals" in script
+
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda *a, **k: [{"name": sit._STALE_CLEANUP_JOB_NAME, "id": "x"}])
+    assert sit.setup_stale_cleanup_cron(scripts_dir=tmp_path)["status"] == "exists"
+
+
 def test_change_gate_allows_when_approved(monkeypatch):
     import tools.self_improvement_tool as sit
     from gateway.session_context import reset_self_improvement_exec, set_self_improvement_exec
