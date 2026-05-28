@@ -139,12 +139,18 @@ P2 라이브 테스트(이사님 피드백 승인 → 재디스패치)에서:
    - `model_tools.py` dispatch — ACP edit-approval 가드 옆에 호출. 게이트 오류 시 fail-safe(차단).
    - tone.md §8 변경은 합리적이라 유지(쿠키 결정).
 
-**라이브 재검증 2 (2026-05-28) — 응답 전달 버그 + 최종 성공:**
-- 증상: 재디스패치 턴은 돌고 에이전트가 응답을 만들지만(`response ready`), 게이트웨이가 그
-  대화 응답을 **전달하지 않고 억제**(`Sending response` 미출력) → 에이전트 제안/질문이 owner에게 안 닿음.
-  `internal=True/False` 무관하게 DM 스레드로의 agent-initiated 턴 응답이 일관 억제됨.
-- 수정: 게이트웨이 응답 라우팅에 의존하지 말고 `_run()` 에서 `_handle_message` **반환 텍스트를 받아
-  직접 카드 스레드에 전송**(`_send_owner_confirm_reply`). internal=True 유지(중복 전송 방지).
+**라이브 재검증 2 (2026-05-28) — 응답 전달 근본원인 + 최종 성공:**
+- 증상: 재디스패치 턴은 돌고 에이전트가 응답을 만들지만(`response ready`), `Sending response` 미출력 →
+  제안/질문이 owner에게 안 닿음.
+- **근본 원인 (버그 아님)**: 플랫폼 전송은 어댑터 외부 래퍼 `base.py::_process_message_background` 에
+  있고, runner 의 안쪽 `_handle_message` 는 에이전트를 **실행하고 텍스트를 반환만** 한다. 정상 인바운드는
+  `handle_message → _process_message_background`(실행+전송). 나는 안쪽 `_handle_message` 를 직접 불러
+  **전송 래퍼를 건너뛴 것**. `response ready`(안쪽 로그)는 뜨고 `Sending response`(래퍼 로그)는 안 뜬 이유.
+- **영향도**: 격리됨 — cron/background/일반 메시지는 모두 정식 래퍼로 전송, 무영향. 자가발전 dispatch 만 해당.
+- **정리 (의도적 선택)**: 정식 래퍼(`handle_message`)로 바꾸면 에이전트가 *별도 task* 로 스폰되어 exec 마커
+  ContextVar 복사 타이밍(디바운스)에 **결정적 write 게이트가 흔들릴 위험**. 그래서 안쪽 `_handle_message` 를
+  **인라인 호출**(마커가 같은 task 컨텍스트로 확실히 전파)하고, 반환 텍스트를 카드 스레드에 직접 전송
+  (`_send_owner_confirm_reply`). 게이트 결정성 > transcript/streaming 부가기능.
 - 최종 라이브 결과 ✅: 카드 승인 → 에이전트 변경 요약 전달 → 에이전트가 `terminal echo>>` 로 적용 시도 →
   **게이트웨이 shell-command 가드가 민감경로(`~/.hermes/`) 감지해 승인 카드 → 쿠키 승인 → 적용**.
 - 게이트 2층 정리: (1) 내 `maybe_require_change_approval`(write_file/patch) + (2) 게이트웨이 command-guard

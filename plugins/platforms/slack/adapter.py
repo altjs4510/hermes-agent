@@ -2827,6 +2827,10 @@ class SlackAdapter(BasePlatformAdapter):
             from gateway.platforms.base import MessageEvent
             from gateway.run import _gateway_runner_ref
             from gateway.session import SessionSource
+            from gateway.session_context import (
+                reset_self_improvement_exec,
+                set_self_improvement_exec,
+            )
 
             runner = _gateway_runner_ref()
             if runner is None:
@@ -2841,33 +2845,28 @@ class SlackAdapter(BasePlatformAdapter):
                 user_name="쿠키",
                 thread_id=thread_ts,
             )
-            # internal=True: system-initiated turn (skips auth/pairing). The
-            # gateway suppresses its conversational delivery either way, so we
-            # capture the returned text in _run() and deliver it ourselves —
-            # internal=True avoids any double-send.
             event = MessageEvent(
                 text=build_execution_prompt(body),
                 source=source,
                 internal=True,
             )
 
-            from gateway.session_context import (
-                reset_self_improvement_exec,
-                set_self_improvement_exec,
-            )
-
+            # Root cause of the earlier "no reply" (investigated 2026-05-28):
+            # NOT a gateway suppression bug. The platform send lives in the
+            # adapter's outer wrapper (_process_message_background); the runner's
+            # inner _handle_message only RUNS the agent and RETURNS the text. The
+            # normal inbound path is handle_message → _process_message_background
+            # (runs agent + sends). Going through that wrapper for this synthetic
+            # turn would spawn the agent in a SEPARATE task, where the exec
+            # marker contextvar may not be copied (debounce/timing) — which would
+            # silently disable the deterministic write gate. So we deliberately
+            # call the inner _handle_message INLINE (marker reliably propagates to
+            # its tool dispatch) and deliver the returned text to the card thread
+            # ourselves. Impact is isolated to this path; cron/background/normal
+            # delivery all use the standard wrapper and are unaffected.
             async def _run() -> None:
-                # Marker propagates to the turn's tool dispatch (same path as the
-                # HERMES_SESSION_* vars) so the file-write guard forces an
-                # owner-confirm before any write_file/patch in this turn.
                 tok = set_self_improvement_exec(proposal_id)
                 try:
-                    # The gateway suppresses conversational delivery for this
-                    # agent-initiated turn into a DM thread (response is built
-                    # but never sent — observed live). _handle_message still
-                    # RETURNS the final text, so we deliver it to the card
-                    # thread ourselves — deterministic, no reliance on the
-                    # gateway's reply-routing heuristics.
                     resp = await runner._handle_message(event)
                     if isinstance(resp, str) and resp.strip() and resp.strip() != "(empty)":
                         await self._send_owner_confirm_reply(dm_channel, thread_ts or "", resp.strip())
