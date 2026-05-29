@@ -646,10 +646,43 @@ def test_mention_outside_strict_mode_still_registers_thread():
     text = "<@U_BOT> hello"
     is_mentioned = f"<@{adapter._bot_user_id}>" in text
     assert is_mentioned
-    if event_thread_ts and not adapter._slack_strict_mention():
-        adapter._mentioned_threads.add(event_thread_ts)
+    mention_thread_anchor = event_thread_ts or thread_ts
+    if mention_thread_anchor and not adapter._slack_strict_mention():
+        adapter._mentioned_threads.add(mention_thread_anchor)
 
     assert thread_ts in adapter._mentioned_threads
+
+
+# ---------------------------------------------------------------------------
+# Regression: an @mention on a brand-new thread ROOT (no thread_ts on the
+# inbound event) must still register the thread, anchored on the message's own
+# ts. Otherwise every later un-@mentioned follow-up reply (thread_ts == this ts)
+# falls through the in_mentioned_thread gate and is dropped — i.e. mid-run
+# steering like "슬랙에서" never reaches the agent.
+# ---------------------------------------------------------------------------
+
+def test_root_mention_registers_thread_anchored_on_own_ts():
+    adapter = _make_adapter(strict_mention=False)
+    adapter._bot_user_id = "U_BOT"
+    adapter._mentioned_threads = set()
+    adapter._MENTIONED_THREADS_MAX = 5000
+
+    # Root message of a fresh thread: Slack delivers no thread_ts yet.
+    ts = "1780012334.448169"
+    event_thread_ts = None
+
+    text = "<@U_BOT> 그 이사님이 보내신 메시지 어디더라"
+    is_mentioned = f"<@{adapter._bot_user_id}>" in text
+    assert is_mentioned
+    mention_thread_anchor = event_thread_ts or ts
+    if mention_thread_anchor and not adapter._slack_strict_mention():
+        adapter._mentioned_threads.add(mention_thread_anchor)
+
+    # The thread is now registered under the root ts, so a later reply whose
+    # event_thread_ts == ts will satisfy in_mentioned_thread and be ingested.
+    assert ts in adapter._mentioned_threads
+    follow_up_thread_ts = ts
+    assert follow_up_thread_ts in adapter._mentioned_threads
 
 
 # ---------------------------------------------------------------------------
