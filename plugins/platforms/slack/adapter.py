@@ -3358,8 +3358,18 @@ class SlackAdapter(BasePlatformAdapter):
             # Skipped in strict mode: strict_mention=true bots must be
             # re-mentioned every turn, so remembering the thread would
             # defeat the feature (and re-enable agent-to-agent ack loops).
-            if event_thread_ts and not self._slack_strict_mention():
-                self._mentioned_threads.add(event_thread_ts)
+            #
+            # Anchor on `event_thread_ts or ts`: when the @mention is the *root*
+            # message of a brand-new thread, Slack's inbound event carries no
+            # thread_ts yet, so the thread anchor is the message's own ts. Using
+            # event_thread_ts alone here meant a root-mention thread was never
+            # registered, and every later un-@mentioned follow-up reply
+            # (thread_ts == this ts) fell through the in_mentioned_thread gate
+            # and got dropped — i.e. mid-run steering like "슬랙에서" never even
+            # reached the agent.
+            mention_thread_anchor = event_thread_ts or ts
+            if mention_thread_anchor and not self._slack_strict_mention():
+                self._mentioned_threads.add(mention_thread_anchor)
                 if len(self._mentioned_threads) > self._MENTIONED_THREADS_MAX:
                     to_remove = list(self._mentioned_threads)[
                         : self._MENTIONED_THREADS_MAX // 2
