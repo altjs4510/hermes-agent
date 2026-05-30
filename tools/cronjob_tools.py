@@ -437,6 +437,41 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     return None
 
 
+def _validate_enabled_toolsets(names: Optional[List[str]]) -> Optional[str]:
+    """Reject unknown toolset names at the create/update boundary.
+
+    Without this, an LLM-supplied ``enabled_toolsets`` containing a name that
+    matches no registered toolset (e.g. guessing ``mcp_ms365`` for an MCP
+    server whose real toolset is ``mcp-ms365-mcp`` / alias ``ms365-mcp``) was
+    silently dropped by model_tools' resolution loop — the job ran with the
+    intended tools missing and no error, only discovered at first execution.
+
+    MCP servers register a canonical toolset ``mcp-<server>`` plus a raw
+    server-name alias, so the correct name to enable an MCP server's tools is
+    ``mcp-<server>`` (or the bare ``<server>``), never ``mcp_<server>``.
+
+    Returns an error string if any name is unknown, else None.
+    """
+    if not names:
+        return None
+    try:
+        from toolsets import validate_toolset, get_toolset_names
+    except Exception:
+        # If toolsets can't be imported here, don't block — resolution will
+        # still warn at runtime.
+        return None
+    unknown = [n for n in names if not validate_toolset(n)]
+    if not unknown:
+        return None
+    available = ", ".join(sorted(get_toolset_names()))
+    return (
+        f"Unknown toolset name(s): {', '.join(repr(n) for n in unknown)}. "
+        f"To enable an MCP server's tools use 'mcp-<server>' (e.g. "
+        f"'mcp-ms365-mcp'), not 'mcp_<server>'. "
+        f"Available toolsets: {available}"
+    )
+
+
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     prompt = str(job.get("prompt") or "")
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
@@ -589,6 +624,13 @@ def cronjob(
                             "Use cronjob(action='list') to see available jobs.",
                             success=False,
                         )
+
+            # Reject unknown toolset names so a typo'd / hallucinated MCP
+            # toolset isn't silently dropped (e.g. 'mcp_ms365').
+            if enabled_toolsets:
+                ts_error = _validate_enabled_toolsets(enabled_toolsets)
+                if ts_error:
+                    return tool_error(ts_error, success=False)
 
             job = create_job(
                 prompt=prompt or "",
@@ -754,6 +796,10 @@ def cronjob(
                             )
                 updates["context_from"] = refs or None
             if enabled_toolsets is not None:
+                if enabled_toolsets:
+                    ts_error = _validate_enabled_toolsets(enabled_toolsets)
+                    if ts_error:
+                        return tool_error(ts_error, success=False)
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
@@ -907,7 +953,7 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             "enabled_toolsets": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Optional list of toolset names to restrict the job's agent to (e.g. [\"web\", \"terminal\", \"file\", \"delegation\"]). When set, only tools from these toolsets are loaded, significantly reducing input token overhead. When omitted, all default tools are loaded. Infer from the job's prompt — e.g. use \"web\" if it calls web_search, \"terminal\" if it runs scripts, \"file\" if it reads files, \"delegation\" if it calls delegate_task. On update, pass an empty array to clear."
+                "description": "Optional list of toolset names to restrict the job's agent to (e.g. [\"web\", \"terminal\", \"file\", \"delegation\"]). When set, only tools from these toolsets are loaded, significantly reducing input token overhead. When omitted, all default tools are loaded. Infer from the job's prompt — e.g. use \"web\" if it calls web_search, \"terminal\" if it runs scripts, \"file\" if it reads files, \"delegation\" if it calls delegate_task. To enable an MCP server's tools, use the toolset name \"mcp-<server>\" (e.g. \"mcp-ms365-mcp\" for the ms365-mcp server) or the bare server name — NOT \"mcp_<server>\". Unknown toolset names are rejected. On update, pass an empty array to clear."
             },
             "workdir": {
                 "type": "string",
