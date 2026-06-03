@@ -2071,6 +2071,54 @@ class SlackAdapter(BasePlatformAdapter):
             return set()
         return set(re.findall(r"<@([A-Z0-9]+)(?:\|[^>]+)?>", text))
 
+    async def _enrich_mentions(
+        self, text: str, chat_id: str = "", team_id: str = ""
+    ) -> str:
+        """Resolve ``<@U...>`` mention tokens inline to ``<@U...|name>``.
+
+        The model otherwise sees opaque IDs like ``<@U0AMEDGBDU5>`` and must
+        hold an ID→name map in its head to connect a request ("조이 알터에게
+        전달") to the participant who was actually pointed at. Enriching the
+        token inline makes that bridge self-evident while *keeping the raw ID*
+        so the agent can still DM/route by it.
+
+        Idempotent: tokens that already carry a ``|label`` are left untouched.
+        The bot's own mention is skipped (stripped separately by callers).
+        """
+        if not text or "<@" not in text:
+            return text
+        ids = self._extract_user_mentions(text)
+        if not ids:
+            return text
+        bot_uid = (
+            self._team_bot_user_ids.get(team_id, self._bot_user_id)
+            if team_id
+            else self._bot_user_id
+        )
+        name_map: Dict[str, str] = {}
+        for uid in ids:
+            if bot_uid and uid == bot_uid:
+                continue
+            # Display-only enrichment runs *after* routing. Use names already
+            # cached by routing/thread-context resolution — never trigger a
+            # fresh users.info lookup here. This keeps message handling latency
+            # flat and, critically, avoids resolving co-mentioned bots whose
+            # bot-status the routing layer deliberately did not probe.
+            name = self._user_name_cache.get(uid)
+            if name and name != uid:
+                name_map[uid] = name
+        if not name_map:
+            return text
+
+        def _sub(m: "re.Match") -> str:
+            # Group 2 = existing label; leave already-labelled mentions as-is.
+            if m.group(2) is not None:
+                return m.group(0)
+            name = name_map.get(m.group(1))
+            return f"<@{m.group(1)}|{name}>" if name else m.group(0)
+
+        return re.sub(r"<@([A-Z0-9]+)(?:\|([^>]+))?>", _sub, text)
+
     async def _is_slack_bot_user(
         self,
         user_id: str,
@@ -3261,6 +3309,13 @@ class SlackAdapter(BasePlatformAdapter):
                 )
             if thread_context:
                 text = thread_context + text
+
+        # Resolve <@U...> mentions inline to <@U...|name> across the live
+        # message, linked-message context, and thread context in one pass, so
+        # the agent sees who was pointed at without reverse-resolving raw IDs.
+        # Idempotent + bot-mention-skipping, so routing decisions above (which
+        # ran on the raw text) are unaffected.
+        text = await self._enrich_mentions(text, chat_id=channel_id, team_id=team_id)
 
         # Determine message type
         msg_type = MessageType.TEXT
