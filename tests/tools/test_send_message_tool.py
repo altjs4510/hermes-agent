@@ -479,7 +479,8 @@ class TestSendMessageTool:
             force_document=False,
         )
 
-    def test_slack_session_person_name_uses_native_approval_then_sends_dm(self):
+    def test_slack_owner_session_person_name_skips_gate_and_sends_dm(self):
+        # W2: owner driving the session → gate skipped (no self-loop). [6/4]
         slack_cfg = SimpleNamespace(enabled=True, token="xoxb-test", extra={})
         config = SimpleNamespace(
             platforms={Platform.SLACK: slack_cfg},
@@ -494,7 +495,8 @@ class TestSendMessageTool:
                 "HERMES_SESSION_THREAD_ID": "111.222",
             }.get(name, default)
 
-        with patch("gateway.config.load_gateway_config", return_value=config), \
+        with patch.dict("os.environ", {"HERMES_OWNER_IDS": "U_OWNER"}, clear=False), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch("gateway.channel_directory.resolve_channel_name", return_value=None), \
              patch("gateway.session_context.get_session_env", side_effect=_session_env), \
@@ -517,12 +519,7 @@ class TestSendMessageTool:
         assert result["success"] is True
         resolve_mock.assert_awaited_once_with("xoxb-test", "로이봉 이사님")
         open_dm_mock.assert_awaited_once_with("xoxb-test", "U987654321")
-        approval_mock.assert_called_once()
-        approval_kwargs = approval_mock.call_args.kwargs
-        assert approval_kwargs["pattern_key"] == "tool:send_message:slack"
-        assert approval_kwargs["allow_permanent"] is False
-        assert "target=로이봉 이사님" in approval_kwargs["command"]
-        assert "hello" in approval_kwargs["command"]
+        approval_mock.assert_not_called()  # owner → no gate (W2 owner-skip)
         send_mock.assert_awaited_once_with(
             Platform.SLACK,
             slack_cfg,
@@ -534,7 +531,8 @@ class TestSendMessageTool:
         )
         mirror_mock.assert_called_once()
 
-    def test_slack_session_mention_target_uses_native_approval_then_sends_dm(self):
+    def test_slack_owner_session_mention_target_skips_gate_and_sends_dm(self):
+        # W2: owner driving the session → gate skipped. [6/4]
         slack_cfg = SimpleNamespace(enabled=True, token="xoxb-test", extra={})
         config = SimpleNamespace(
             platforms={Platform.SLACK: slack_cfg},
@@ -549,7 +547,8 @@ class TestSendMessageTool:
                 "HERMES_SESSION_THREAD_ID": "111.222",
             }.get(name, default)
 
-        with patch("gateway.config.load_gateway_config", return_value=config), \
+        with patch.dict("os.environ", {"HERMES_OWNER_IDS": "U_OWNER"}, clear=False), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch("gateway.channel_directory.resolve_channel_name", return_value=None), \
              patch("gateway.session_context.get_session_env", side_effect=_session_env), \
@@ -570,10 +569,7 @@ class TestSendMessageTool:
 
         assert result["success"] is True
         open_dm_mock.assert_awaited_once_with("xoxb-test", "U123456789")
-        approval_mock.assert_called_once()
-        approval_kwargs = approval_mock.call_args.kwargs
-        assert approval_kwargs["allow_permanent"] is False
-        assert "target=<@U123456789>" in approval_kwargs["command"]
+        approval_mock.assert_not_called()  # owner → no gate (W2 owner-skip)
         send_mock.assert_awaited_once_with(
             Platform.SLACK,
             slack_cfg,
@@ -585,7 +581,10 @@ class TestSendMessageTool:
         )
         mirror_mock.assert_called_once()
 
-    def test_slack_session_send_stops_when_native_approval_denied(self):
+    def test_slack_non_owner_session_send_blocked_on_behalf(self):
+        # W3: a non-owner (e.g. executive) send is on-behalf → blocked +
+        # escalated to the owner, NOT gated in the requester's own session
+        # (the 6/2 Eric→조이 self-approval loophole). [6/4]
         slack_cfg = SimpleNamespace(enabled=True, token="xoxb-test", extra={})
         config = SimpleNamespace(
             platforms={Platform.SLACK: slack_cfg},
@@ -595,18 +594,19 @@ class TestSendMessageTool:
         def _session_env(name, default=""):
             return {
                 "HERMES_SESSION_PLATFORM": "slack",
-                "HERMES_SESSION_USER_ID": "U_OWNER",
+                "HERMES_SESSION_USER_ID": "U_EXEC",
                 "HERMES_SESSION_CHAT_ID": "C_ORIGIN",
                 "HERMES_SESSION_THREAD_ID": "111.222",
             }.get(name, default)
 
-        with patch("gateway.config.load_gateway_config", return_value=config), \
+        with patch.dict("os.environ", {"HERMES_OWNER_IDS": "U_OWNER"}, clear=False), \
+             patch("gateway.config.load_gateway_config", return_value=config), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch("gateway.channel_directory.resolve_channel_name", return_value=None), \
              patch("gateway.session_context.get_session_env", side_effect=_session_env), \
              patch("model_tools._run_async", side_effect=_run_async_immediately), \
              patch("tools.send_message_tool._open_slack_dm_channel", new=AsyncMock(return_value="D123DMCHAN")), \
-             patch("tools.approval.request_gateway_approval", return_value={"approved": False, "message": "BLOCKED: denied"}) as approval_mock, \
+             patch("tools.send_message_tool._escalate_on_behalf_to_owner", return_value=True) as escalate_mock, \
              patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
              patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
             result = json.loads(
@@ -620,9 +620,9 @@ class TestSendMessageTool:
             )
 
         assert result["success"] is False
-        assert result["approval_required"] is True
-        assert "denied" in result["error"]
-        approval_mock.assert_called_once()
+        assert result["blocked"] is True
+        assert result["owner_approval_required"] is True
+        escalate_mock.assert_called_once()
         send_mock.assert_not_awaited()
         mirror_mock.assert_not_called()
 

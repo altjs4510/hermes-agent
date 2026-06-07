@@ -17,6 +17,7 @@ import re
 import secrets
 import time
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Tuple, List
 from urllib.parse import parse_qs, urlparse
@@ -281,6 +282,78 @@ def _serialize_slack_blocks_for_agent(blocks: list, max_chars: int = 6000) -> st
         payload = payload[: max_chars - 18].rstrip() + "\n... [truncated]"
 
     return f"[Slack Block Kit payload for this message]\n```json\n{payload}\n```"
+
+
+class _CanvasHTMLToText(HTMLParser):
+    """Minimal Slack-canvas (quip) HTML → markdown-ish text.
+
+    Canvas ``url_private`` bodies come back as ``text/html`` (a
+    ``quip-canvas-content`` div) with headings, ``<p class="line">``
+    paragraphs, ``<ul>/<li>`` lists, ``<a>@U…</a>`` mentions and
+    ``<img alt=…>:emoji:</img>`` wrappers.  The agent only needs readable
+    text, not faithful HTML, so collapse tags to lightweight markdown.
+    """
+
+    _HEADINGS = {
+        "h1": "# ", "h2": "## ", "h3": "### ",
+        "h4": "#### ", "h5": "##### ", "h6": "###### ",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._out: List[str] = []
+        self._list_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag in self._HEADINGS:
+            self._out.append("\n\n" + self._HEADINGS[tag])
+        elif tag == "p":
+            self._out.append("\n\n")
+        elif tag == "br":
+            self._out.append("\n")
+        elif tag == "li":
+            self._out.append("\n" + "  " * max(0, self._list_depth - 1) + "- ")
+        elif tag in ("ul", "ol"):
+            self._list_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._HEADINGS or tag == "p":
+            self._out.append("\n")
+        elif tag in ("ul", "ol"):
+            self._list_depth = max(0, self._list_depth - 1)
+
+    def handle_data(self, data: str) -> None:
+        if data:
+            self._out.append(data)
+
+    def text(self) -> str:
+        raw = "".join(self._out)
+        out: List[str] = []
+        blank = 0
+        for ln in raw.splitlines():
+            ln = ln.rstrip()
+            if not ln.strip():
+                blank += 1
+                if blank <= 1:
+                    out.append("")
+            else:
+                blank = 0
+                out.append(ln)
+        return "\n".join(out).strip()
+
+
+def _canvas_html_to_markdown(html_str: str, max_chars: int = 12000) -> str:
+    """Convert a Slack canvas HTML body to lightweight markdown for the agent."""
+    parser = _CanvasHTMLToText()
+    try:
+        parser.feed(html_str)
+        parser.close()
+    except Exception:  # pragma: no cover - never break message handling
+        return ""
+    out = parser.text()
+    if len(out) > max_chars:
+        out = out[:max_chars].rstrip() + "\n… [canvas truncated]"
+    return out
 
 
 def _render_slack_attachments_for_agent(attachments: list, max_chars: int = 4000) -> str:
@@ -3445,6 +3518,47 @@ class SlackAdapter(BasePlatformAdapter):
                             e,
                             exc_info=True,
                         )
+            elif mimetype == "application/vnd.slack-docs" or f.get("filetype") == "quip":
+                # Slack canvas (quip doc). url_private serves the rendered HTML
+                # body — fetch + convert to markdown and inject so the agent can
+                # actually read shared canvases instead of seeing only the ID.
+                canvas_url = f.get("url_private") or url
+                if canvas_url:
+                    try:
+                        canvas_md = await self._fetch_slack_canvas_markdown(
+                            canvas_url, team_id=team_id
+                        )
+                        if canvas_md:
+                            # Canvas mentions arrive as bare "@U…"; normalize to
+                            # "<@U…>" so _enrich_mentions can resolve names.
+                            canvas_md = re.sub(
+                                r"@(U[A-Z0-9]{6,})\b", r"<@\1>", canvas_md
+                            )
+                            canvas_md = await self._enrich_mentions(
+                                canvas_md, chat_id=channel_id, team_id=team_id
+                            )
+                            raw_title = f.get("title") or f.get("name") or "Canvas"
+                            safe_title = re.sub(
+                                r"[^\w.\-:&<>|@() ]", " ", raw_title
+                            ).strip()
+                            injection = f"[Slack Canvas: {safe_title}]\n{canvas_md}"
+                            text = f"{injection}\n\n{text}" if text else injection
+                    except Exception as e:  # pragma: no cover - defensive logging
+                        detail = self._describe_slack_download_failure(
+                            e, file_obj=f
+                        ) or self._describe_slack_api_error(
+                            getattr(e, "response", None), file_obj=f
+                        )
+                        if detail:
+                            attachment_notices.append(detail)
+                            logger.warning("[Slack] %s", detail)
+                        else:
+                            logger.warning(
+                                "[Slack] Failed to read canvas %s: %s",
+                                f.get("id"),
+                                e,
+                                exc_info=True,
+                            )
             elif url:
                 # Try to handle as a document attachment
                 try:
@@ -4735,6 +4849,48 @@ class SlackAdapter(BasePlatformAdapter):
                         await asyncio.sleep(1.5 * (attempt + 1))
                         continue
                     raise
+
+    async def _fetch_slack_canvas_markdown(self, url: str, team_id: str = "") -> str:
+        """Fetch a Slack canvas (quip doc) body and return markdown-ish text.
+
+        Canvases legitimately serve ``text/html`` from ``url_private`` (the
+        rendered doc), so — unlike ``_download_slack_file_bytes`` — we accept
+        HTML here and convert it to lightweight markdown the agent can read.
+        """
+        import httpx
+
+        bot_token = (
+            self._team_clients[team_id].token
+            if team_id and team_id in self._team_clients
+            else self.config.token
+        )
+
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            for attempt in range(3):
+                try:
+                    response = await client.get(
+                        url,
+                        headers={"Authorization": f"Bearer {bot_token}"},
+                    )
+                    response.raise_for_status()
+                    return _canvas_html_to_markdown(response.text)
+                except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                    if (
+                        isinstance(exc, httpx.HTTPStatusError)
+                        and exc.response.status_code < 429
+                    ):
+                        raise
+                    if attempt < 2:
+                        logger.debug(
+                            "Slack canvas fetch retry %d/2 for %s: %s",
+                            attempt + 1,
+                            url[:80],
+                            exc,
+                        )
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        continue
+                    raise
+        return ""
 
     async def _download_slack_file_bytes(self, url: str, team_id: str = "") -> bytes:
         """Download a Slack file and return raw bytes, with retry."""

@@ -1138,6 +1138,31 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
 
+    # W1 side-effect audit ledger — no_agent cron deliveries bypass the tool
+    # executor entirely (direct _send_to_platform / live adapter), so the
+    # model_tools post-tool hook never sees them. Record here (W0 paths ②③b).
+    # Best-effort: never raises, never blocks delivery.
+    try:
+        from gateway.side_effect_audit import record_side_effect
+        _audit_job_id = job.get("id", "")
+        _audit_targets = ",".join(
+            f"{t.get('platform')}:{t.get('chat_id')}" for t in targets
+        )
+        record_side_effect(
+            tool_name="_deliver_result",
+            action_class="send",
+            source=f"cron:{_audit_job_id}",
+            actor=f"cron:{_audit_job_id}",
+            status="failed" if delivery_errors else "success",
+            target_ref=_audit_targets or None,
+            args={"job": job.get("name", _audit_job_id), "no_agent": bool(job.get("no_agent"))},
+            result_preview=cleaned_delivery_content,
+            error_type="delivery_failed" if delivery_errors else None,
+            blocked_reason="; ".join(delivery_errors) if delivery_errors else None,
+        )
+    except Exception:
+        pass
+
     if delivery_errors:
         return "; ".join(delivery_errors)
     return None

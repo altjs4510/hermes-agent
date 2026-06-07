@@ -1099,6 +1099,44 @@ def init_agent(
                 _uid, len(_dropped), ", ".join(_dropped),
             )
 
+        # W7 P2 — SHADOW authz. Compute what the central policy engine WOULD
+        # decide for each tool and log any divergence from this tier-based L1
+        # decision. Does NOT enforce (L1 above still rules). Zero divergence over
+        # real traffic is the proof that the engine reproduces L1 before P3 flips
+        # enforcement on. Best-effort: never affects tool availability.
+        try:
+            from agent.identity import get_current_actor
+            from agent.tool_capabilities import capability_of
+            from gateway import authz
+            _actor = get_current_actor(user_id_hint=_uid)
+            _dropped_set = set(_dropped)
+            _kept_names = [t.get("function", {}).get("name", "") for t in agent.tools]
+            _divergences = []
+            for _nm, _l1_allow in (
+                [(n, True) for n in _kept_names if n] + [(n, False) for n in _dropped_set if n]
+            ):
+                _d = authz.evaluate(_actor, capability_of(_nm))
+                if _d.allow != _l1_allow:
+                    _divergences.append((_nm, capability_of(_nm), _l1_allow, _d.allow, _d.rule_id))
+            if _divergences:
+                logger.warning(
+                    "[authz-shadow] %d divergence(s) for %s: %s",
+                    len(_divergences), _actor, _divergences[:8],
+                )
+                try:
+                    from gateway.side_effect_audit import record_side_effect
+                    for _nm, _cap, _l1a, _ea, _rid in _divergences:
+                        record_side_effect(
+                            tool_name="authz_shadow", action_class="authz_shadow",
+                            source="shadow", status="divergence", actor=str(_actor),
+                            target_ref=_nm,
+                            rationale=f"cap={_cap} l1_allow={_l1a} engine_allow={_ea} rule={_rid}",
+                        )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # Self-awareness note so the model acts within tier cleanly instead of
         # confabulating reasons (MCP down / guest perms) or handing out owner-only
         # operator commands. Critical instructions are in English so they survive the
@@ -1126,7 +1164,15 @@ def init_agent(
                 "SOUL/persona/config. If an executive asks for one of these, do NOT "
                 "attempt it and do NOT invent a technical excuse — explain briefly in "
                 "Korean that this particular change needs the owner 쿠키's own confirmation, "
-                f"and @-mention {_owner_mention}. For everything else, act with confidence."
+                f"and @-mention {_owner_mention}. "
+                "EXCEPTION — feedback about YOU: if this executive gives feedback, a complaint, or an "
+                "improvement request about how you behave, answer, or are configured (your tone, accuracy, "
+                "missing knowledge, a workflow/persona/SOUL change), do NOT try to apply it yourself and do "
+                "NOT @-mention the owner for it. Instead call the propose_self_improvement tool to capture "
+                "their feedback and your proposed improvement (it only records + routes to the owner privately, "
+                "it does not change anything now), then thank them warmly and say you'll propose the improvement. "
+                "Never expose the owner-side approval mechanics to them. "
+                "For everything else, act with confidence."
             )
         else:
             _access_note = (
