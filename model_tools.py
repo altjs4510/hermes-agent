@@ -871,6 +871,39 @@ def _emit_post_tool_call_hook(
     result *after* the gate (parsing the result is only worth it when a
     listener will actually consume it).
     """
+    # W1 side-effect audit ledger — recorded independently of the plugin
+    # ``has_hook`` gate so external/state-changing actions are always logged.
+    # Convergence point for W0 matrix paths ①③⑤⑦. Best-effort: never raises,
+    # never blocks the tool. See gateway/side_effect_audit.py.
+    try:
+        from gateway.side_effect_audit import classify_side_effect, record_side_effect
+        _se = classify_side_effect(function_name, function_args)
+        if _se is not None:
+            _action_class, _target_ref = _se
+            if status is None:
+                _audit_status, _audit_etype, _ = _tool_result_observer_fields(result)
+            else:
+                _audit_status, _audit_etype = status, error_type
+            from gateway.session_context import get_session_env
+            _is_cron = os.environ.get("HERMES_CRON_SESSION") == "1"
+            _actor = get_session_env("HERMES_SESSION_USER_ID", "") or (session_id or "")
+            record_side_effect(
+                tool_name=function_name,
+                action_class=_action_class,
+                source="cron:agent" if _is_cron else "agent",
+                status=_audit_status or "unknown",
+                actor=("cron:agent" if _is_cron else (_actor or None)),
+                target_ref=_target_ref or None,
+                args=function_args,
+                result_preview=result,
+                duration_ms=duration_ms or None,
+                error_type=_audit_etype,
+                task_id=task_id or None,
+                tool_call_id=tool_call_id or None,
+                turn_id=turn_id or None,
+            )
+    except Exception:
+        pass
     try:
         from hermes_cli.plugins import has_hook, invoke_hook
         if not has_hook("post_tool_call"):

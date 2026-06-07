@@ -456,6 +456,105 @@ async def _open_slack_dm_channel(token: str, user_id: str) -> Optional[str]:
             return None
 
 
+def _describe_actor(actor_uid: str) -> str:
+    """Resolve a requester's Slack id to a human label (people roster), else id."""
+    if not actor_uid:
+        return "알 수 없는 사용자"
+    try:
+        from gateway.people_priority import feedback_priority
+        label = (feedback_priority(actor_uid) or {}).get("label")
+        if label and label != "외부 사용자":
+            return f"{label} ({actor_uid})"
+    except Exception:
+        pass
+    return actor_uid
+
+
+def _escalate_on_behalf_to_owner(config, *, actor_label, platform_name, target_ref, preview) -> bool:
+    """Best-effort: DM the owner that an on-behalf send was blocked. Returns sent?.
+
+    The W1 ledger record is the durable trail; this DM is a courtesy heads-up.
+    """
+    try:
+        from gateway.config import Platform
+        owner_ids = [u.strip() for u in os.getenv("HERMES_OWNER_IDS", "").split(",") if u.strip()]
+        if not owner_ids:
+            return False
+        owner_id = owner_ids[0]
+        slack_cfg = config.platforms.get(Platform.SLACK) if config else None
+        token = str(getattr(slack_cfg, "token", "") or "") if slack_cfg else ""
+        if not token:
+            return False
+        from model_tools import _run_async
+        from tools.self_improvement_tool import _open_dm, _slack_api
+
+        text = (
+            "🔐 대리 발송 승인 요청 (보류됨)\n"
+            f"• 요청자: {actor_label}\n"
+            f"• 대상: {platform_name}:{target_ref}\n"
+            f"• 내용: {preview}\n\n"
+            "타인 대신 발송이라 쿠키 승인 없이 보내지 않았습니다. 직접 보내거나 무시하세요."
+        )
+
+        async def _do() -> bool:
+            dm = await _open_dm(token, owner_id)
+            if not dm:
+                return False
+            posted = await _slack_api(token, "chat.postMessage", {"channel": dm, "text": text})
+            return bool(posted.get("ok"))
+
+        return bool(_run_async(_do()))
+    except Exception:
+        return False
+
+
+def _block_on_behalf_send(*, config, actor_uid, platform_name, target_ref, message, media_files) -> str:
+    """Block a non-owner's send (on-behalf) and escalate to the owner. [W3]
+
+    guardrails.md §4: sending on someone else's behalf requires explicit owner
+    approval. Records the blocked attempt to the W1 ledger, best-effort DMs the
+    owner, and returns a JSON block result — the send never fires.
+    """
+    actor_label = _describe_actor(actor_uid)
+    preview = (message or "").strip() or _describe_media_for_mirror(media_files) or "(media only)"
+    if len(preview) > 800:
+        preview = preview[:800] + "…"
+
+    try:
+        from gateway.side_effect_audit import record_side_effect
+        record_side_effect(
+            tool_name="send_message",
+            action_class="send",
+            source="agent",
+            status="blocked",
+            actor=actor_uid or None,
+            target_ref=f"{platform_name}:{target_ref}"[:200],
+            args={"requester": actor_label, "message": preview[:200]},
+            blocked_reason="on_behalf_requires_owner_approval",
+        )
+    except Exception:
+        pass
+
+    notified = _escalate_on_behalf_to_owner(
+        config,
+        actor_label=actor_label,
+        platform_name=platform_name,
+        target_ref=target_ref,
+        preview=preview,
+    )
+
+    return json.dumps({
+        "success": False,
+        "blocked": True,
+        "owner_approval_required": True,
+        "error": (
+            f"이건 {actor_label} 님이 요청한 '대리 발송'이라 쿠키(owner) 승인이 필요해 보내지 않았습니다. "
+            + ("쿠키에게 확인 요청을 전달했습니다." if notified
+               else "쿠키 DM 전달은 실패했지만 감사 원장에 기록했습니다.")
+        ),
+    }, ensure_ascii=False)
+
+
 def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
@@ -608,42 +707,80 @@ def _handle_send(args):
     send_thread_id = thread_id
     send_metadata = None
 
-    # Slack sends invoked from Slack are shared side effects. Route them through
-    # Hermes' native gateway approval UI (the same Allow Once/Session/Deny
-    # Block Kit flow used for dangerous command approvals), then perform the
-    # actual delivery only after approval.  Keep cookie.alter's target
-    # resolution, but do not use the alter-style owner-confirm/token gate as
-    # the primary UX.
-    if platform_name == "slack":
+    # ── W2: send authorization — single decision point ───────────────────
+    # Slack sends are shared side effects routed through Hermes' native
+    # gateway-approval UI (the Allow Once/Session/Deny Block Kit flow), NOT the
+    # alter-style owner-confirm token gate (that stays scoped to
+    # self_improvement adoption — see gateway/owner_confirm.py).
+    #
+    # Axes (L1 in agent_init.py already strips send_message from
+    # non-owner/non-executive sessions, so only owner & executive reach here):
+    #   • owner, session-ful      → SKIP gate. The owner authorizes by asking;
+    #     prompting them to approve their own send is a meaningless self-loop.
+    #     [W2 decision, 6/4]  (Audited by the W1 post-tool hook, source=agent.)
+    #   • non-owner, session-ful   → ON-BEHALF: a non-owner (e.g. an executive)
+    #     using send_message is asking the bot to message a NEW external target
+    #     on their behalf (in-thread replies don't use send_message —
+    #     operating.md §13). guardrails.md §4 requires EXPLICIT owner approval.
+    #     The interactive W2 gate would render in the REQUESTER's own session
+    #     (self-approval loophole — the 6/2 Eric→조이 case), so on-behalf sends
+    #     are BLOCKED here and escalated to the owner's DM. [W3 decision, 6/4]
+    #   • session-less (CLI `hermes send`, MCP messages_send) → AUDIT-ONLY: the
+    #     interactive UI needs a live session to render, so there is nowhere to
+    #     prompt. These run on the owner's own machine and bypass tool_executor
+    #     (the W1 hook never sees them), so the audit is emitted after the send
+    #     below to close the session-less hole. [W2 decision, 6/4]
+    from gateway.session_context import get_session_env
+    _src_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    _actor_uid = get_session_env("HERMES_SESSION_USER_ID", "")
+    _origin_chat = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    _is_cron = os.environ.get("HERMES_CRON_SESSION") == "1"
+    _session_ful = bool(_actor_uid and _origin_chat)
+    _session_less = not _session_ful and not _is_cron
+    _owner_ids = {u.strip() for u in os.getenv("HERMES_OWNER_IDS", "").split(",") if u.strip()}
+    _actor_is_owner = bool(_actor_uid) and _actor_uid in _owner_ids
+
+    # W3/W4: on-behalf send (non-owner driving a session). W4 — if the owner
+    # pre-registered an explicit, unexpired delegation for this person+action in
+    # context/delegations.yaml, the send proceeds autonomously (audited with the
+    # delegation id). Otherwise W3 blocks + escalates. Empty registry → block.
+    if _session_ful and not _actor_is_owner:
+        _deleg = None
         try:
-            from gateway.session_context import get_session_env
-
-            source_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-            owner_user_id = get_session_env("HERMES_SESSION_USER_ID", "")
-            origin_chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-            if source_platform == "slack" and owner_user_id and origin_chat_id:
-                from tools.approval import request_gateway_approval
-
-                preview = cleaned_message.strip() or _describe_media_for_mirror(media_files) or "(media only)"
-                if len(preview) > 1200:
-                    preview = preview[:1200] + "..."
-                approval = request_gateway_approval(
-                    command=(
-                        f"send_message platform=slack target={target_ref or chat_id} "
-                        f"thread={thread_id or '-'}\n\n{preview}"
-                    ),
-                    description="Slack message send requires approval",
-                    pattern_key="tool:send_message:slack",
-                    allow_permanent=False,
-                )
-                if not approval.get("approved"):
-                    return json.dumps({
-                        "success": False,
-                        "approval_required": True,
-                        "error": approval.get("message") or "Slack send was not approved.",
-                    })
-        except Exception as exc:
-            return json.dumps({"error": f"Slack send approval failed: {exc}"})
+            from gateway.delegations import match_delegation
+            _deleg = match_delegation(
+                actor_uid=_actor_uid,
+                action_class="send",
+                platform=platform_name,
+                target=str(target_ref or chat_id),
+            )
+        except Exception:
+            _deleg = None
+        if _deleg is None:
+            return _block_on_behalf_send(
+                config=config,
+                actor_uid=_actor_uid,
+                platform_name=platform_name,
+                target_ref=str(target_ref or chat_id),
+                message=cleaned_message,
+                media_files=media_files,
+            )
+        # W4: a valid owner-granted delegation authorizes this on-behalf send.
+        # Record the exercise (the send completion itself is logged by the W1
+        # post-tool hook); this row carries the delegation rationale.
+        try:
+            from gateway.side_effect_audit import record_side_effect
+            record_side_effect(
+                tool_name="send_message",
+                action_class="send",
+                source="delegated",
+                status="delegated",
+                actor=_actor_uid or None,
+                target_ref=f"{platform_name}:{target_ref or chat_id}"[:200],
+                rationale=f"delegation:{_deleg.get('id', '?')}",
+            )
+        except Exception:
+            pass
 
     try:
         from model_tools import _run_async
@@ -668,6 +805,28 @@ def _handle_send(args):
         if send_metadata and isinstance(result, dict) and result.get("success"):
             result["owner_confirm_required"] = True
             result["note"] = "Slack send is awaiting owner confirmation."
+
+        # W2: session-less send audit. CLI (`hermes send`) and MCP
+        # (messages_send) bypass tool_executor, so the W1 post-tool hook never
+        # records them — close that hole here with the actual outcome.
+        # Session-ful agent sends are covered by hook A (source=agent) and are
+        # deliberately NOT recorded here to avoid double-counting.
+        if _session_less:
+            try:
+                from gateway.side_effect_audit import record_side_effect
+                _ok = isinstance(result, dict) and bool(result.get("success"))
+                record_side_effect(
+                    tool_name="send_message",
+                    action_class="send",
+                    source="session-less",
+                    status="success" if _ok else "failed",
+                    actor=_actor_uid or None,
+                    target_ref=str(target_ref or chat_id)[:200],
+                    result_preview=result,
+                    error_type=None if _ok else "send_failed",
+                )
+            except Exception:
+                pass
 
         # Mirror the sent message into the target's gateway session. Owner-confirm
         # previews are not delivery; mirror only after a real send.
