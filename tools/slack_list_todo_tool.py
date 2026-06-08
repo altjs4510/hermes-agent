@@ -114,7 +114,7 @@ def _add(args: dict) -> str:
         "initial_fields": fields,
     })
     if not r.get("ok"):
-        return tool_error(f"slackLists.items.create failed: {r.get('error')}")
+        return tool_error(f"slackLists.items.create failed: {r.get('error')}" + _FALLBACK_HINT)
     item = r.get("item") or {}
     return json.dumps({
         "ok": True, "action": "add", "title": title,
@@ -126,7 +126,7 @@ def _add(args: dict) -> str:
 def _list(args: dict) -> str:
     r = _get("slackLists.items.list", {"list_id": _env("COOKIE_TODO_LIST_ID")})
     if not r.get("ok"):
-        return tool_error(f"slackLists.items.list failed: {r.get('error')}")
+        return tool_error(f"slackLists.items.list failed: {r.get('error')}" + _FALLBACK_HINT)
     col_status = _env("COOKIE_TODO_COL_STATUS")
     col_completed = _env("COOKIE_TODO_COL_COMPLETED")
     include_done = bool(args.get("include_done"))
@@ -161,7 +161,7 @@ def _complete(args: dict) -> str:
         "cells": cells,
     })
     if not r.get("ok"):
-        return tool_error(f"slackLists.items.update failed: {r.get('error')}")
+        return tool_error(f"slackLists.items.update failed: {r.get('error')}" + _FALLBACK_HINT)
     return json.dumps({"ok": True, "action": "complete", "id": item_id}, ensure_ascii=False)
 
 
