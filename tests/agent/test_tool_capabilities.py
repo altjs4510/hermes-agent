@@ -16,14 +16,20 @@ from agent.tool_capabilities import (
     EXECUTIVE_CAPABILITIES,
 )
 
-# Copied verbatim from agent_init.py:961-998.
+# Owner-only tools (subset of agent_init.py _OWNER_ONLY_TOOLS that stays owner-only).
+# NOTE (2026-06-08, SOUL §0): todo/cronjob/delegate_task were split out of this set
+# into `task_ops` (executive-holdable) — see _TASK_OPS_TOOLS below. L1 still lists
+# them in _OWNER_ONLY_TOOLS pending the enforce cutover, so the P2 shadow logs a
+# deliberate divergence there; this test tracks the *capability* mapping, not L1.
 _OWNER_ONLY_TOOLS = {
     "write_file", "patch",
     "terminal", "process", "execute_code", "computer_use",
-    "memory", "todo", "skill_manage", "cronjob", "delegate_task",
+    "memory", "skill_manage",
     "ha_call_service", "spotify_playback", "spotify_queue",
     "discord_admin",
 }
+# Split out of admin → task_ops: executive-holdable, NOT owner-only.
+_TASK_OPS_TOOLS = {"todo", "cronjob", "delegate_task"}
 _OTHER_BLOCKED_EXTRA = {
     "send_message", "discord",
     "browser_navigate", "browser_click", "browser_type", "browser_scroll",
@@ -39,6 +45,16 @@ _OTHER_BLOCKED_EXTRA = {
 @pytest.mark.parametrize("tool", sorted(_OWNER_ONLY_TOOLS))
 def test_owner_only_tools_map_to_owner_only_capability(tool):
     assert capability_of(tool) in OWNER_ONLY_CAPABILITIES
+
+
+@pytest.mark.parametrize("tool", sorted(_TASK_OPS_TOOLS))
+def test_task_ops_tools_are_executive_holdable(tool):
+    # Split out of admin (SOUL §0): executive may hold these, so they must be
+    # in the executive-capability set and NOT owner-only.
+    cap = capability_of(tool)
+    assert cap == "task_ops"
+    assert cap in EXECUTIVE_CAPABILITIES
+    assert cap not in OWNER_ONLY_CAPABILITIES
 
 
 @pytest.mark.parametrize("tool", sorted(_OTHER_BLOCKED_EXTRA))
