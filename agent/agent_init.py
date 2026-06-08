@@ -1141,62 +1141,81 @@ def init_agent(
                     return True  # mutating MCP tool (mcp_<server>_create_... etc.)
                 return False
 
-        _before = len(agent.tools)
-        _dropped = sorted(
-            t.get("function", {}).get("name", "")
-            for t in agent.tools
-            if _blocked(t.get("function", {}).get("name", ""))
-        )
-        agent.tools = [
-            t for t in agent.tools
-            if not _blocked(t.get("function", {}).get("name", ""))
-        ]
-        if _dropped:
-            # Always log (gateway agents run quiet_mode=True, so a print would be
-            # swallowed — this is the only signal the access gate fired).
-            logger.info(
-                "Access gate (%s): user=%s dropped %d tool(s): %s",
-                "executive" if _is_executive else "non-owner",
-                _uid, len(_dropped), ", ".join(_dropped),
-            )
-
-        # W7 P2 — SHADOW authz. Compute what the central policy engine WOULD
-        # decide for each tool and log any divergence from this tier-based L1
-        # decision. Does NOT enforce (L1 above still rules). Zero divergence over
-        # real traffic is the proof that the engine reproduces L1 before P3 flips
-        # enforcement on. Best-effort: never affects tool availability.
+        # W7 P3 — ENFORCE via the central authz engine. The L1 `_blocked` closure
+        # above is retained as (a) the rollback baseline and (b) the divergence
+        # audit reference. HERMES_AUTHZ_ENFORCE=0 falls back to L1 instantly.
+        _enforce_authz = os.getenv("HERMES_AUTHZ_ENFORCE", "1") != "0"
+        _actor = None
+        _authz_blocked = None
         try:
             from agent.identity import get_current_actor
             from agent.tool_capabilities import capability_of
             from gateway import authz
             _actor = get_current_actor(user_id_hint=_uid)
-            _dropped_set = set(_dropped)
-            _kept_names = [t.get("function", {}).get("name", "") for t in agent.tools]
-            _divergences = []
-            for _nm, _l1_allow in (
-                [(n, True) for n in _kept_names if n] + [(n, False) for n in _dropped_set if n]
-            ):
-                _d = authz.evaluate(_actor, capability_of(_nm))
-                if _d.allow != _l1_allow:
-                    _divergences.append((_nm, capability_of(_nm), _l1_allow, _d.allow, _d.rule_id))
-            if _divergences:
-                logger.warning(
-                    "[authz-shadow] %d divergence(s) for %s: %s",
-                    len(_divergences), _actor, _divergences[:8],
-                )
-                try:
-                    from gateway.side_effect_audit import record_side_effect
-                    for _nm, _cap, _l1a, _ea, _rid in _divergences:
+
+            def _authz_blocked(name: str) -> bool:  # noqa: F811
+                return not authz.evaluate(_actor, capability_of(name)).allow
+        except Exception:
+            # Any import/actor failure → safe fallback to L1 (never open up by error).
+            _enforce_authz = False
+
+        _use_authz = _enforce_authz and _authz_blocked is not None
+        _effective_blocked = _authz_blocked if _use_authz else _blocked
+
+        _before = len(agent.tools)
+        _dropped = sorted(
+            t.get("function", {}).get("name", "")
+            for t in agent.tools
+            if _effective_blocked(t.get("function", {}).get("name", ""))
+        )
+        agent.tools = [
+            t for t in agent.tools
+            if not _effective_blocked(t.get("function", {}).get("name", ""))
+        ]
+        if _dropped:
+            # Always log (gateway agents run quiet_mode=True, so a print would be
+            # swallowed — this is the only signal the access gate fired).
+            logger.info(
+                "Access gate (%s, engine=%s): user=%s dropped %d tool(s): %s",
+                "executive" if _is_executive else "non-owner",
+                "authz" if _use_authz else "L1",
+                _uid, len(_dropped), ", ".join(_dropped),
+            )
+
+        # Divergence audit: where the authz engine differs from the L1 baseline.
+        # Post-cutover this records the intended policy deltas (e.g. task_ops opened
+        # to executives) and surfaces any unintended drift. Best-effort only.
+        if _actor is not None and _authz_blocked is not None:
+            try:
+                from gateway.side_effect_audit import record_side_effect
+                _all_names = [
+                    t.get("function", {}).get("name", "") for t in agent.tools
+                ] + list(_dropped)
+                _divergences = []
+                for _nm in _all_names:
+                    if not _nm:
+                        continue
+                    _l1_block = _blocked(_nm)
+                    _az_block = _authz_blocked(_nm)
+                    if _l1_block != _az_block:
+                        _divergences.append((_nm, capability_of(_nm), _l1_block, _az_block))
+                if _divergences:
+                    logger.warning(
+                        "[authz-divergence] %d for %s (enforce=%s): %s",
+                        len(_divergences), _actor, _use_authz, _divergences[:8],
+                    )
+                    for _nm, _cap, _l1b, _azb in _divergences:
                         record_side_effect(
                             tool_name="authz_shadow", action_class="authz_shadow",
                             source="shadow", status="divergence", actor=str(_actor),
                             target_ref=_nm,
-                            rationale=f"cap={_cap} l1_allow={_l1a} engine_allow={_ea} rule={_rid}",
+                            rationale=(
+                                f"cap={_cap} l1_block={_l1b} authz_block={_azb} "
+                                f"enforce={_use_authz}"
+                            ),
                         )
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            except Exception:
+                pass
 
         # Self-awareness note so the model acts within tier cleanly instead of
         # confabulating reasons (MCP down / guest perms) or handing out owner-only
