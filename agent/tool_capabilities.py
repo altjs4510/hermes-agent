@@ -16,7 +16,8 @@ comments in agent_init):
   mcp_write — mutating MCP tools whose capability isn't explicitly declared
   write     — local filesystem writes (write_file, patch)
   exec      — shell / process / code execution
-  admin     — identity/config/personal stores/spawning/platform admin
+  admin     — owner identity/config/personal stores/spawning/platform admin
+  task_ops  — task/automation ops (todo, cronjob, delegate_task); executive-holdable
 
 Role defaults that reproduce today's L1 (owner / executive / other) live in
 gateway/authz.py — NOT here. This module only answers "what kind of action is
@@ -29,6 +30,13 @@ capabilities must reproduce L1 exactly:
   - {send, browse, generate, collab, mcp_write} → owner + executive
                                        (= _OTHER_BLOCKED_TOOLS minus owner-only)
   - {read} and UNKNOWN tools        → everyone
+
+INTENDED DIVERGENCE (2026-06-08, 박봉섭 이사 지침 / SOUL §0): todo, cronjob,
+delegate_task moved admin → ``task_ops`` (owner + executive). L1's
+_OWNER_ONLY_TOOLS still lists them, so the P2 shadow now logs a *deliberate*
+divergence for these three on executive actors (L1=block, engine=allow). This
+is the policy change we want to verify before the enforce cutover — NOT a
+classification bug. All OTHER tools must still show ZERO divergence.
 Today an unlisted non-MCP tool is blocked for NO ONE, so unknown → ``read``
 here (equivalence). Tightening unknown tools to a restrictive default is a
 deliberate P3 *policy* choice (it WILL diverge — that's what shadow mode
@@ -60,11 +68,16 @@ _EXPLICIT: dict[str, str] = {
     "write_file": "write", "patch": "write",
     # exec — shell / process / code
     "terminal": "exec", "process": "exec", "execute_code": "exec", "computer_use": "exec",
-    # admin — identity / config / personal / spawning / platform admin
-    "memory": "admin", "todo": "admin", "skill_manage": "admin",
-    "cronjob": "admin", "delegate_task": "admin",
+    # admin — owner's identity / config / personal stores / platform admin (owner-only)
+    "memory": "admin", "skill_manage": "admin",
     "ha_call_service": "admin", "spotify_playback": "admin", "spotify_queue": "admin",
     "discord_admin": "admin",
+    # task_ops — task/automation operations; executive may hold (NOT owner-only).
+    # Split out of admin 2026-06-08 (박봉섭 이사 지침, SOUL §0): todo 등록 / cron /
+    # Agent 위임은 업무 운영이라 executive 에 열되, memory·identity·config 같은
+    # 개인 admin 과 분리. ⚠️ L1(agent_init _OWNER_ONLY_TOOLS)은 아직 이 셋을 드롭함
+    # → shadow 에 의도된 divergence 로 찍힘. enforce cutover 시 L1 이 이 분류를 따름.
+    "todo": "task_ops", "cronjob": "task_ops", "delegate_task": "task_ops",
     # send — external messaging
     "send_message": "send", "discord": "send",
     "feishu_drive_reply_comment": "send", "feishu_drive_add_comment": "send",
@@ -84,7 +97,7 @@ _EXPLICIT: dict[str, str] = {
 # Capabilities granted by the owner-only tier ceiling (= _OWNER_ONLY_TOOLS).
 OWNER_ONLY_CAPABILITIES = frozenset({"write", "exec", "admin"})
 # Capabilities an executive keeps but "other" loses.
-EXECUTIVE_CAPABILITIES = frozenset({"send", "browse", "generate", "collab", "mcp_write"})
+EXECUTIVE_CAPABILITIES = frozenset({"send", "browse", "generate", "collab", "mcp_write", "task_ops"})
 
 
 def capability_of(tool_name: str) -> str:
