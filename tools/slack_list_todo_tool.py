@@ -165,20 +165,34 @@ def _complete(args: dict) -> str:
     return json.dumps({"ok": True, "action": "complete", "id": item_id}, ensure_ascii=False)
 
 
+_FALLBACK_HINT = (
+    " — FALLBACK (availability > all): do NOT drop the request. If you have the "
+    "`terminal` tool, use the slack-lists-todo skill's curl recipe directly. If "
+    "you do NOT (e.g. you are acting for a non-owner like 이사님), escalate to the "
+    "owner (쿠키) via DM/mention so it is registered manually. Never silently fail."
+)
+
+
 def slack_list_todo_tool(args: dict) -> str:
-    """Dispatch by action. Returns a JSON string (tool_error on failure)."""
+    """Dispatch by action. Returns a JSON string; NEVER raises (so the agent can
+    fall back to the skill/curl path or owner escalation on any failure)."""
     if not _token():
-        return tool_error("HERMES_SLACK_BOT_TOKEN not set")
+        return tool_error("no Slack bot token (HERMES_SLACK_BOT_TOKEN/SLACK_BOT_TOKEN)" + _FALLBACK_HINT)
     if not _env("COOKIE_TODO_LIST_ID"):
-        return tool_error("COOKIE_TODO_LIST_ID not set")
+        return tool_error("COOKIE_TODO_LIST_ID not set" + _FALLBACK_HINT)
     action = (args.get("action") or "add").strip()
-    if action == "add":
-        return _add(args)
-    if action == "list":
-        return _list(args)
-    if action == "complete":
-        return _complete(args)
-    return tool_error(f"unknown action '{action}' (add | list | complete)")
+    try:
+        if action == "add":
+            return _add(args)
+        if action == "list":
+            return _list(args)
+        if action == "complete":
+            return _complete(args)
+        return tool_error(f"unknown action '{action}' (add | list | complete)")
+    except Exception as e:
+        # Network/HTTP/parse errors must surface as a clean tool_error (not a raised
+        # exception) so the agent recognizes the failure and falls back.
+        return tool_error(f"slack_list_todo {action} failed: {type(e).__name__}: {e}" + _FALLBACK_HINT)
 
 
 def check_slack_list_todo_requirements() -> bool:
