@@ -1,10 +1,13 @@
-"""W7 P2 shadow EQUIVALENCE test — the proof that the policy engine reproduces
-L1 tier behavior exactly (0 divergence) before P3 flips enforcement on.
+"""W7 authz EQUIVALENCE test — proves the policy engine reproduces L1 tier
+behavior, EXCEPT for explicitly intended policy deltas.
 
 For a representative tool set, we compute L1's drop decision (replicating
 agent_init.py:_blocked for executive and other tiers) and the engine's
-decision (capability_of + authz.evaluate), and assert they agree for EVERY
-tool. Any disagreement here is exactly what the live shadow logger would flag.
+decision (capability_of + authz.evaluate). Originally (P2) they had to agree on
+EVERY tool. As of the P3 enforce cutover (2026-06-08, SOUL §0) the executive
+tier has one intended delta — task_ops (todo/cronjob/delegate_task) opened — so
+that test asserts the divergence set is EXACTLY those three. The "other" tier
+and owner remain fully equivalent. Any unlisted disagreement is a real bug.
 """
 
 from datetime import datetime, timezone
@@ -75,7 +78,14 @@ def _empty_policy(tmp_path):
     authz._cache["policy"] = None
 
 
-def test_executive_engine_matches_l1_zero_divergence():
+# Intended policy delta (2026-06-08, SOUL §0 / 박봉섭 이사 지침): todo, cronjob,
+# delegate_task moved admin → task_ops, opening them to executives at the P3 enforce
+# cutover. The engine MUST still match L1 for EVERY other tool; only these three may
+# diverge, and only in the direction L1=block → engine=allow.
+_EXECUTIVE_INTENDED_OPENINGS = {"todo", "cronjob", "delegate_task"}
+
+
+def test_executive_engine_matches_l1_except_intended_task_ops():
     actor = ActorId("user", EXEC)
     divergences = []
     for name in _TOOLS:
@@ -83,7 +93,13 @@ def test_executive_engine_matches_l1_zero_divergence():
         engine_allow = authz.evaluate(actor, capability_of(name)).allow
         if engine_allow != l1_allow:
             divergences.append((name, capability_of(name), l1_allow, engine_allow))
-    assert divergences == [], f"executive divergences: {divergences}"
+    # Every divergence must be an intended task_ops opening (L1 blocked → engine allows).
+    for name, cap, l1_allow, engine_allow in divergences:
+        assert name in _EXECUTIVE_INTENDED_OPENINGS, f"unexpected divergence: {(name, cap, l1_allow, engine_allow)}"
+        assert cap == "task_ops"
+        assert (l1_allow, engine_allow) == (False, True)
+    # And all three intended openings must be present (nothing silently reverted).
+    assert {n for n, *_ in divergences} == _EXECUTIVE_INTENDED_OPENINGS
 
 
 def test_other_engine_matches_l1_zero_divergence():
