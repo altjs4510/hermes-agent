@@ -1363,6 +1363,11 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                     result = await _slack_entry.standalone_sender_fn(
                         pconfig, chat_id, chunk, thread_id=thread_id
                     )
+                if isinstance(result, dict) and result.get("success"):
+                    # Standalone send bypasses adapter.send(), so register the
+                    # ts ourselves — otherwise un-@mentioned replies to this
+                    # bot-posted thread get dropped by the inbound gate.
+                    _register_bot_sent_ts_on_live_adapter(result.get("message_id"), thread_id)
                 # Cookie user-token fallback: if the bot can't access the
                 # conversation, retry posting as Cookie via SLACK_USER_TOKEN
                 # (owner-approved). Only triggers on the first chunk.
@@ -1681,6 +1686,42 @@ async def _registry_standalone_send(platform_name, pconfig, chat_id, message, th
     if entry is None or entry.standalone_sender_fn is None:
         return {"error": f"{platform_name} plugin not registered or missing standalone_sender_fn"}
     return await entry.standalone_sender_fn(pconfig, chat_id, message, thread_id=thread_id)
+
+
+def _register_bot_sent_ts_on_live_adapter(sent_ts, thread_id=None):
+    """Register a standalone-sent Slack ts on the live adapter's
+    ``_bot_message_ts`` so mention-less thread replies to bot-posted threads are
+    picked up by the inbound gate — parity with ``SlackAdapter.send()``.
+
+    The standalone Slack send path posts via the registry's
+    standalone_sender_fn and therefore never touches the live adapter's
+    ``_bot_message_ts``. Without this, a bot message posted by a tool/cron/skill
+    (e.g. the weekly-share draft) opens a thread the gate doesn't recognize, so
+    the owner's un-@mentioned reply to that thread is dropped at
+    ``reply_to_bot_thread``. No-op when out of process (cron in a
+    separate process: the runner weakref is ``None``)."""
+    if not sent_ts:
+        return
+    try:
+        from gateway.run import _gateway_runner_ref
+        from gateway.config import Platform
+
+        runner = _gateway_runner_ref()
+        if runner is None:
+            return
+        adapter = runner.adapters.get(Platform.SLACK)
+        if adapter is None or not hasattr(adapter, "_bot_message_ts"):
+            return
+        adapter._bot_message_ts.add(sent_ts)
+        if thread_id:
+            adapter._bot_message_ts.add(thread_id)
+        cap = getattr(adapter, "_BOT_TS_MAX", 5000)
+        if len(adapter._bot_message_ts) > cap:
+            excess = len(adapter._bot_message_ts) - cap // 2
+            for old_ts in list(adapter._bot_message_ts)[:excess]:
+                adapter._bot_message_ts.discard(old_ts)
+    except Exception:
+        logger.debug("Could not register bot-sent ts on live Slack adapter", exc_info=True)
 
 
 async def _send_slack(token, chat_id, message, *, thread_id=None):
