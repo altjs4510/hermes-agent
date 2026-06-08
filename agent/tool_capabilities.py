@@ -78,6 +78,10 @@ _EXPLICIT: dict[str, str] = {
     # 개인 admin 과 분리. ⚠️ L1(agent_init _OWNER_ONLY_TOOLS)은 아직 이 셋을 드롭함
     # → shadow 에 의도된 divergence 로 찍힘. enforce cutover 시 L1 이 이 분류를 따름.
     "todo": "task_ops", "cronjob": "task_ops", "delegate_task": "task_ops",
+    # slack_list_todo — native wrapper over Slack Lists API for 쿠키's todo SoT.
+    # task_ops so executives can register todos without raw exec (the skill+curl
+    # path needed `terminal`=exec, owner-only). See tools/slack_list_todo_tool.py.
+    "slack_list_todo": "task_ops",
     # send — external messaging
     "send_message": "send", "discord": "send",
     "feishu_drive_reply_comment": "send", "feishu_drive_add_comment": "send",
