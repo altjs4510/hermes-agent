@@ -905,6 +905,22 @@ def _emit_post_tool_call_hook(
             )
     except Exception:
         pass
+
+    # Egress lockdown (Phase 1, shadow): mark session content-taint after a
+    # successful *read* tool so a later side-effect tool can be evaluated
+    # against the read history. Best-effort; never raises, never blocks. Only
+    # read tools taint (classify_read_source returns None for side effects), so
+    # this never mis-marks an egress call as a read.
+    try:
+        _se_status = status
+        if _se_status is None:
+            _se_status, _, _ = _tool_result_observer_fields(result)
+        if _se_status not in ("error", "blocked", "failed"):
+            from gateway.session_taint import mark_read
+            mark_read(function_name, function_args, result)
+    except Exception:
+        pass
+
     try:
         from hermes_cli.plugins import has_hook, invoke_hook
         if not has_hook("post_tool_call"):
@@ -929,6 +945,77 @@ def _emit_post_tool_call_hook(
         )
     except Exception as _hook_err:
         logger.debug("post_tool_call hook error: %s", _hook_err)
+
+
+def _emit_egress_shadow_preflight(
+    function_name: str,
+    function_args: Dict[str, Any],
+    *,
+    task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+) -> None:
+    """Egress lockdown preflight (Phase 1, SHADOW): record what the egress
+    policy WOULD do for this side-effect tool given the session's content
+    taint, then return — never blocks (shadow mode always proceeds).
+
+    Only egress-capability tools in a tainted session emit an event (skips the
+    no-taint hot path and read tools entirely). See gateway/egress_policy.py.
+    Best-effort: any failure is swallowed so dispatch is never affected.
+    """
+    try:
+        from gateway.egress_policy import EGRESS_CAPABILITIES, evaluate_egress, get_mode
+        from agent.tool_capabilities import capability_of
+
+        cap = capability_of(function_name)
+        if cap not in EGRESS_CAPABILITIES:
+            return
+        from gateway.session_taint import current_taint
+
+        taint = current_taint()
+        if not taint.any_taint:
+            return  # no taint → keep current behavior, no shadow noise
+
+        from gateway.side_effect_audit import classify_side_effect
+
+        _se = classify_side_effect(function_name, function_args)
+        resource = (_se[1] if _se else "") or ""
+
+        from agent.identity import get_current_actor
+
+        actor = get_current_actor()
+        decision = evaluate_egress(actor, cap, resource, taint, function_args)
+
+        _status = {
+            "allow": "would_allow",
+            "audit_only": "would_allow",
+            "confirm": "would_confirm",
+            "block": "would_block",
+        }.get(decision.action, "would_allow")
+
+        from gateway.side_effect_audit import record_side_effect
+
+        _sources = ",".join(sorted({e.source_class for e in taint.events})) or "unknown"
+        record_side_effect(
+            tool_name="egress_lockdown",
+            action_class="egress_shadow",
+            source="shadow",
+            status=_status,
+            actor=str(actor),
+            target_ref=resource or None,
+            task_id=task_id or None,
+            tool_call_id=tool_call_id or None,
+            turn_id=turn_id or None,
+            rationale=(
+                f"mode={get_mode()} tool={function_name} cap={cap} "
+                f"rule={decision.rule_id} risk={decision.risk_level} "
+                f"external={taint.external_content_seen} private={taint.private_context_seen} "
+                f"sources={_sources}: {decision.reason}"
+            ),
+        )
+    except Exception:
+        pass
 
 
 def handle_function_call(
@@ -1150,6 +1237,18 @@ def handle_function_call(
                 return json.dumps(
                     {"error": "자가발전 변경 게이트 실패로 적용 보류"}, ensure_ascii=False
                 )
+
+        # Egress lockdown preflight (Phase 1, SHADOW): records would_allow/
+        # would_confirm/would_block for side-effect tools in a content-tainted
+        # session, then always proceeds. No enforcement until Phase 2.
+        _emit_egress_shadow_preflight(
+            function_name,
+            function_args,
+            task_id=task_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            turn_id=turn_id,
+        )
 
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
