@@ -2343,17 +2343,272 @@ async def _send_yuanbao(chat_id, message, media_files=None):
         return _error(f"Yuanbao send failed: {e}")
 
 
+UPDATE_MESSAGE_SCHEMA = {
+    "name": "update_message",
+    "description": (
+        "Edit a message THIS bot previously sent on a messaging platform — e.g. to "
+        "correct a mistake the owner pointed out. Only the bot's own messages can be "
+        "edited (platform rule).\n\n"
+        "Provide 'target' (same format as send_message: 'slack:#channel' or "
+        "'slack:CHANNELID') and 'new_message' (the full replacement text — editing "
+        "REPLACES the message, it does not append). 'message_ts' identifies which "
+        "message to edit; if you omit it, the bot's most recent message in that "
+        "channel/thread is edited (Slack). When unsure which message, read the "
+        "channel/thread first to get the right ts."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": "Where the message lives. Format: 'platform:chat_id', 'platform:#channel-name', or 'platform:chat_id:thread_id'. Example: 'slack:#쿠키테스트', 'slack:C0ANUN2AQER'.",
+            },
+            "new_message": {
+                "type": "string",
+                "description": "The full replacement text. Editing replaces the entire message body.",
+            },
+            "message_ts": {
+                "type": "string",
+                "description": "Optional. The id/timestamp of the message to edit (Slack 'ts', Discord message id). If omitted, the bot's most recent message in the target channel/thread is edited.",
+            },
+        },
+        "required": ["target", "new_message"],
+    },
+}
+
+
+async def _update_slack_standalone(token, chat_id, message_ts, new_text):
+    """Edit a Slack message via chat.update with the bot token (out-of-process
+    fallback when no live adapter is reachable). Mirrors ``_send_slack``."""
+    try:
+        import aiohttp
+    except ImportError:
+        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+    try:
+        from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+        _proxy = resolve_proxy_url()
+        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+        url = "https://slack.com/api/chat.update"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
+            payload = {"channel": chat_id, "ts": message_ts, "text": new_text, "mrkdwn": True}
+            async with session.post(url, headers=headers, json=payload, **_req_kw) as resp:
+                data = await resp.json()
+                if data.get("ok"):
+                    return {"success": True, "platform": "slack", "chat_id": chat_id, "message_id": data.get("ts", message_ts)}
+                error_code = data.get("error", "unknown")
+                result = _error(f"Slack API error: {error_code}")
+                result["slack_error"] = error_code
+                return result
+    except Exception as e:
+        return _error(f"Slack edit failed: {e}")
+
+
+async def _resolve_latest_bot_message_ts_slack(token, chat_id, thread_ts=None):
+    """Return the ts of the most recent message authored by THIS bot in the
+    given Slack channel (or thread, if thread_ts is set). None if not found."""
+    try:
+        import aiohttp
+    except ImportError:
+        return None
+    try:
+        from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+        _proxy = resolve_proxy_url()
+        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+        headers = {"Authorization": f"Bearer {token}"}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
+            # Resolve our own bot user id.
+            async with session.get("https://slack.com/api/auth.test", headers=headers, **_req_kw) as resp:
+                auth = await resp.json()
+            bot_uid = auth.get("user_id") if auth.get("ok") else None
+            if not bot_uid:
+                return None
+            # Most recent messages first.
+            if thread_ts:
+                api = "https://slack.com/api/conversations.replies"
+                params = {"channel": chat_id, "ts": thread_ts, "limit": "50"}
+            else:
+                api = "https://slack.com/api/conversations.history"
+                params = {"channel": chat_id, "limit": "50"}
+            async with session.get(api, headers=headers, params=params, **_req_kw) as resp:
+                data = await resp.json()
+            if not data.get("ok"):
+                return None
+            msgs = data.get("messages", [])
+            # history returns newest-first; replies returns oldest-first.
+            ordered = msgs if not thread_ts else list(reversed(msgs))
+            for m in ordered:
+                if m.get("user") == bot_uid or (m.get("bot_id") and m.get("user") == bot_uid):
+                    return m.get("ts")
+            # Fallback: match on bot_id presence when user field is absent.
+            for m in ordered:
+                if m.get("bot_id") and not m.get("user"):
+                    return m.get("ts")
+            return None
+    except Exception:
+        return None
+
+
+def _handle_update(args):
+    """Edit a previously-sent message (the bot's own) on a platform target."""
+    target = args.get("target", "")
+    new_message = args.get("new_message", "")
+    message_ts = (args.get("message_ts") or "").strip() or None
+    if not target or not new_message:
+        return tool_error("Both 'target' and 'new_message' are required.")
+
+    parts = target.split(":", 1)
+    platform_name = parts[0].strip().lower()
+    target_ref = parts[1].strip() if len(parts) > 1 else None
+
+    chat_id = None
+    thread_id = None
+    if target_ref:
+        chat_id, thread_id, is_explicit = _parse_target_ref(platform_name, target_ref)
+        if not is_explicit:
+            try:
+                from gateway.channel_directory import resolve_channel_name
+                resolved = resolve_channel_name(platform_name, target_ref)
+                if resolved:
+                    chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
+            except Exception:
+                pass
+            if not chat_id:
+                # Treat the raw ref as a chat id (e.g. a bare Slack channel ID).
+                chat_id = target_ref
+    if not chat_id:
+        return tool_error("Could not resolve a channel from 'target'. Use 'platform:chat_id' or 'platform:#channel'.")
+
+    try:
+        from gateway.config import load_gateway_config, Platform
+        config = load_gateway_config()
+        platform = Platform(platform_name)
+    except (ValueError, KeyError):
+        return tool_error(f"Unknown platform: {platform_name}")
+    except Exception as e:
+        return tool_error(f"Failed to load gateway config: {e}")
+
+    pconfig = config.platforms.get(platform)
+    if not pconfig or not pconfig.enabled:
+        return tool_error(f"Platform '{platform_name}' is not configured.")
+
+    # --- Permission gate (mirrors send: on-behalf edits require owner) [W3] ---
+    from gateway.session_context import get_session_env
+    _actor_uid = get_session_env("HERMES_SESSION_USER_ID", "")
+    _origin_chat = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    _session_ful = bool(_actor_uid and _origin_chat)
+    _owner_ids = {u.strip() for u in os.getenv("HERMES_OWNER_IDS", "").split(",") if u.strip()}
+    _actor_is_owner = bool(_actor_uid) and _actor_uid in _owner_ids
+    if _session_ful and not _actor_is_owner:
+        return _block_on_behalf_send(
+            config=config,
+            actor_uid=_actor_uid,
+            platform_name=platform_name,
+            target_ref=str(target_ref or chat_id),
+            message=new_message,
+            media_files=[],
+        )
+
+    from model_tools import _run_async
+
+    # Resolve which message to edit.
+    if not message_ts:
+        if platform_name == "slack":
+            message_ts = _run_async(
+                _resolve_latest_bot_message_ts_slack(str(pconfig.token or ""), chat_id, thread_id)
+            )
+        if not message_ts:
+            return tool_error(
+                "No 'message_ts' given and could not find a recent bot message to edit. "
+                "Read the channel/thread and pass the exact message id."
+            )
+
+    # Execute: prefer the live in-process adapter (registers, uniform across
+    # platforms), fall back to a standalone Slack chat.update.
+    result = None
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+    except Exception:
+        runner = None
+    if runner is not None:
+        try:
+            adapter = runner.adapters.get(platform)
+        except Exception:
+            adapter = None
+        if adapter is not None and hasattr(adapter, "edit_message"):
+            try:
+                send_result = _run_async(
+                    adapter.edit_message(chat_id, message_ts, new_message)
+                )
+                if getattr(send_result, "success", False):
+                    result = {"success": True, "platform": platform_name, "chat_id": chat_id, "message_id": message_ts}
+                else:
+                    result = _error(f"Edit failed: {getattr(send_result, 'error', 'unknown')}")
+            except Exception as e:
+                result = _error(f"Edit via adapter failed: {e}")
+    if result is None:
+        # Out-of-process fallback (Slack only).
+        if platform_name == "slack":
+            result = _run_async(_update_slack_standalone(str(pconfig.token or ""), chat_id, message_ts, new_message))
+        else:
+            result = _error(
+                f"No live adapter for '{platform_name}' to edit the message "
+                "(out-of-process editing is only supported for Slack)."
+            )
+
+    # Audit the edit (best-effort).
+    try:
+        from gateway.side_effect_audit import record_side_effect
+        record_side_effect(
+            tool_name="update_message",
+            action_class="edit",
+            source="tool",
+            status="ok" if isinstance(result, dict) and result.get("success") else "error",
+            actor=_actor_uid or None,
+            target_ref=f"{platform_name}:{chat_id}:{message_ts}"[:200],
+        )
+    except Exception:
+        pass
+
+    return json.dumps(result)
+
+
+def update_message_tool(args, **kw):
+    """Handle update_message (edit a previously-sent bot message)."""
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return tool_error("Interrupted")
+    return _handle_update(args)
+
+
+def _check_update_message():
+    """Gate update_message identically to send_message."""
+    return _check_send_message()
+
+
 # --- Registry ---
 from tools.registry import tool_error
 
-# NOTE: ``send_message`` is intentionally NOT registered as an agent-callable
-# model tool. The agent should not decide on its own to fire off cross-platform
-# messages or reactions. The send engine in this module (``_send_to_platform``,
-# ``_send_via_adapter``, ``_parse_target_ref``, the per-platform ``_send_*``
-# helpers) remains the shared transport used by:
-#   - cron delivery (cron/scheduler.py)
-#   - the ``hermes send`` CLI command (hermes_cli/send_cmd.py)
-#   - the gateway kanban notifier (dashboard-toggled, outside agent control)
-#   - the standalone MCP server (mcp_serve.py), which is an opt-in surface
-# Those callers import the helpers directly; none of them need the registry
-# entry.
+# NOTE (upstream): upstream intentionally does NOT register ``send_message`` as
+# an agent-callable model tool. For the Cookie alter deployment we DO register
+# both ``send_message`` and ``update_message`` — the alter is a personal proxy
+# that sends/edits messages on Cookie's behalf (owner-confirm gated), so these
+# must be agent-callable. Keep this override in mind on future rebases.
+registry.register(
+    name="send_message",
+    toolset="messaging",
+    schema=SEND_MESSAGE_SCHEMA,
+    handler=send_message_tool,
+    check_fn=_check_send_message,
+    emoji="📨",
+)
+
+registry.register(
+    name="update_message",
+    toolset="messaging",
+    schema=UPDATE_MESSAGE_SCHEMA,
+    handler=update_message_tool,
+    check_fn=_check_update_message,
+    emoji="✏️",
+)
