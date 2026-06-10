@@ -275,3 +275,78 @@ class TestInterruptedReplayFiltering:
             {"role": "assistant", "content": "answer"},
             {"role": "user", "content": "third"},
         ]
+
+
+def _resolve_continuation_actor(was_interrupted: bool, pending_uid, owner_uid):
+    """Mirror the actor-hijack guard in _run_agent's interrupt-drain.
+
+    Decides who owns the continuation of an *interrupted* turn when a
+    follow-up event is queued. Returns a dict describing the next turn:
+      - action: "requeue_foreign" | "adopt_pending" | "no_pending"
+      - source_uid: actor the continuation runs under
+      - message: "" when finishing the owner's interrupted work,
+                 None sentinel "<pending-text>" when the foreign/own event
+                 is adopted as the next message.
+
+    Invariant under test: an interrupted turn's continuation must never be
+    inherited by a DIFFERENT actor — that downgrades privileges and re-frames
+    the owner's in-flight action as the foreign actor's request.
+    """
+    if pending_uid is None:
+        return {"action": "no_pending", "source_uid": owner_uid, "message": ""}
+    _pe_uid = str(pending_uid or "")
+    _owner_uid = str(owner_uid or "")
+    if was_interrupted and _pe_uid and _pe_uid != _owner_uid:
+        return {
+            "action": "requeue_foreign",
+            "source_uid": _owner_uid,   # finish under the ORIGINAL identity
+            "message": "",              # no foreign text injected
+        }
+    return {
+        "action": "adopt_pending",
+        "source_uid": _pe_uid or _owner_uid,
+        "message": "<pending-text>",
+    }
+
+
+class TestActorHijackGuard:
+    """A mid-turn follow-up from a different actor must not hijack the
+    interrupted owner's continuation (bot-to-bot reply + credit-exhaustion
+    interrupt → owner's send_message action ran under the bot's reduced
+    privileges and was refused). Regression for that live incident."""
+
+    OWNER = "U_COOKIE"
+    BOT = "U0B3XD4G517"  # the mentioned bot from the live incident
+
+    def test_interrupted_foreign_actor_is_requeued_not_adopted(self):
+        r = _resolve_continuation_actor(
+            was_interrupted=True, pending_uid=self.BOT, owner_uid=self.OWNER
+        )
+        assert r["action"] == "requeue_foreign"
+        # continuation finishes under the OWNER, not the bot
+        assert r["source_uid"] == self.OWNER
+        # no foreign text bleeds into the owner's continuation
+        assert r["message"] == ""
+
+    def test_interrupted_same_actor_followup_is_adopted(self):
+        """Owner's own rapid follow-up while interrupted is a legit merge."""
+        r = _resolve_continuation_actor(
+            was_interrupted=True, pending_uid=self.OWNER, owner_uid=self.OWNER
+        )
+        assert r["action"] == "adopt_pending"
+        assert r["source_uid"] == self.OWNER
+
+    def test_completed_turn_foreign_followup_runs_under_its_own_actor(self):
+        """After NORMAL completion (not interrupted), a foreign follow-up is a
+        fresh turn under its own identity — guard must NOT fire (else loop)."""
+        r = _resolve_continuation_actor(
+            was_interrupted=False, pending_uid=self.BOT, owner_uid=self.OWNER
+        )
+        assert r["action"] == "adopt_pending"
+        assert r["source_uid"] == self.BOT
+
+    def test_empty_pending_uid_does_not_trigger_guard(self):
+        r = _resolve_continuation_actor(
+            was_interrupted=True, pending_uid="", owner_uid=self.OWNER
+        )
+        assert r["action"] == "adopt_pending"

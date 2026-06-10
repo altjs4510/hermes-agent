@@ -17928,6 +17928,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message = pending
                 next_message_id = None
                 next_channel_prompt = None
+                # Actor-hijack guard (context boundary): when the prior turn was
+                # *interrupted*, a follow-up event that landed mid-turn from a
+                # DIFFERENT actor (e.g. a bot-to-bot reply, or any other user)
+                # must NOT inherit the interrupted turn's continuation. The
+                # continuation carries the original actor's in-flight history
+                # (``updated_history`` — including any pending tool-tail) and
+                # represents *their* unfinished action. Adopting the foreign
+                # ``pending_event.source`` here silently ran the owner's action
+                # under the other actor's (reduced) privileges: the L1/authz gate
+                # then dropped send_message et al. and the model re-framed the
+                # owner's request as the foreign actor's and refused it.
+                # Re-queue the foreign event so it is handled as its OWN turn
+                # (under its own identity), and finish the interrupted turn under
+                # the original identity. The re-queued event is drained by this
+                # continuation's own post-turn drain; ``was_interrupted`` is False
+                # there, so this guard does not re-fire (no loop, no loss).
+                if (
+                    was_interrupted
+                    and pending_event is not None
+                    and getattr(pending_event, "source", None) is not None
+                ):
+                    _pe_uid = str(getattr(pending_event.source, "user_id", "") or "")
+                    _owner_uid = str(getattr(source, "user_id", "") or "")
+                    if _pe_uid and _pe_uid != _owner_uid:
+                        logger.warning(
+                            "Interrupt continuation actor mismatch: pending event "
+                            "from %s != interrupted-turn owner %s — re-queueing the "
+                            "foreign event for its own turn; finishing the owner's "
+                            "interrupted turn under its original identity.",
+                            _pe_uid, _owner_uid or "?",
+                        )
+                        _rq_adapter = self.adapters.get(source.platform)
+                        if _rq_adapter is not None and hasattr(_rq_adapter, "_pending_messages"):
+                            merge_pending_message_event(
+                                _rq_adapter._pending_messages, session_key, pending_event
+                            )
+                        pending_event = None
+                        next_source = source
+                        next_message = ""
+                        next_message_id = None
+                        next_channel_prompt = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
                     if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
