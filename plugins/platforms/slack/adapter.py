@@ -630,6 +630,11 @@ class SlackAdapter(BasePlatformAdapter):
         # Track active assistant thread status indicators so stop_typing can
         # clear them (chat_id → thread_ts).
         self._active_status_threads: Dict[str, str] = {}
+        # Status/lifecycle bubbles, keyed by (chat_id, thread_ts, status_key).
+        # send_or_update_status edits the cached message in place instead of
+        # appending a new one — so compaction/billing/context-pressure notices
+        # don't each fire a fresh Slack notification (alarm fatigue, #30045).
+        self._status_message_ids: Dict[Tuple[str, str, str], str] = {}
         # Slash-command contexts: stash response_url + user_id so send()
         # can route the first reply ephemerally.  Keyed by
         # (channel_id, user_id) to avoid cross-user collisions.
@@ -1341,6 +1346,62 @@ class SlackAdapter(BasePlatformAdapter):
             ):
                 self._app.action(_action_id)(self._handle_owner_confirm_action)
 
+            # Message shortcut "쿠키 위키에 저장" (callback_id cookie_wiki_save).
+            # 네이티브 "리스트에 추가"와 같은 List 에 행을 만들되 *즉시* 정리:
+            # link 칸에 permalink → enricher 를 detached 로 바로 실행(event-loop 비점유).
+            # 네이티브 경로는 2분 cron 이 잡고, 숏컷은 클릭 즉시.
+            @self._app.shortcut("cookie_wiki_save")
+            async def handle_wiki_save_shortcut(ack, shortcut, client):
+                await ack()
+                try:
+                    user_id = (shortcut.get("user") or {}).get("id")
+                    channel = (shortcut.get("channel") or {}).get("id")
+                    message = shortcut.get("message") or {}
+                    ts = message.get("ts")
+                    owner_ids = {u.strip() for u in os.getenv("HERMES_OWNER_IDS", "").split(",") if u.strip()}
+                    if owner_ids and user_id not in owner_ids:
+                        if channel and user_id:
+                            try:
+                                await client.chat_postEphemeral(channel=channel, user=user_id,
+                                                                text="이건 쿠키 전용 기능이에요. (위키 저장)")
+                            except Exception:
+                                pass
+                        logger.info("[wiki_save] non-owner blocked: %s", user_id)
+                        return
+                    if not channel or not ts:
+                        logger.warning("[wiki_save] missing channel/ts — skip")
+                        return
+
+                    tts = message.get("thread_ts")
+                    ts_nodot = ts.replace(".", "")
+                    permalink = f"https://ffcoit.slack.com/archives/{channel}/p{ts_nodot}"
+                    if tts:
+                        permalink += f"?thread_ts={tts}&cid={channel}"
+                    list_id = os.getenv("COOKIE_WIKI_LIST_ID", "F0B9TUCMFK2")
+                    # 링크는 네이티브 Message 속성에 (네이티브 add 와 일치). slack 이 permalink
+                    # 문자열을 channel/ts/thread 로 자동 해석. 포맷: message:[permalink].
+                    msg_col = os.getenv("COOKIE_WIKI_COL_MESSAGE", "Col0B93HA70NQ")
+                    await client.api_call("slackLists.items.create", json={
+                        "list_id": list_id,
+                        "initial_fields": [{"column_id": msg_col, "message": [permalink]}]})
+                    logger.info("[wiki_save] row created (Message col): %s/%s", channel, ts)
+
+                    # 즉시 정리 — enricher detached 실행 (블로킹/이벤트루프 점유 X)
+                    import subprocess
+                    import sys as _sys
+                    enr = os.path.expanduser("~/.hermes/scripts/wiki-enrich.py")
+                    subprocess.Popen([_sys.executable, enr], start_new_session=True,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                    if channel and user_id:
+                        try:
+                            await client.chat_postEphemeral(channel=channel, user=user_id,
+                                                            text="🔖 위키에 저장했어요 — 주제 정리 중 (몇 초).")
+                        except Exception:
+                            pass
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.exception("[wiki_save] failed: %s", e)
+
             # Bring up the handler and watchdog atomically. ``_running`` only
             # flips to True after the handler is alive so the watchdog loop
             # observes the live task immediately; on any failure here we tear
@@ -1751,6 +1812,43 @@ class SlackAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             return SendResult(success=False, error=str(e))
+
+    async def send_or_update_status(
+        self,
+        chat_id: str,
+        status_key: str,
+        content: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a status message, or edit the previous one with the same key.
+
+        Mirrors the Telegram adapter (#30045). Status/lifecycle callbacks
+        (context-pressure, compaction, billing notices, etc.) used to append a
+        fresh Slack message on every call — each one a new thread notification,
+        the main driver of alarm fatigue. With this method the first call sends
+        and the message ts is remembered; subsequent calls with the same
+        (chat_id, thread_ts, status_key) edit that message in place via
+        chat.update — Slack does NOT re-notify on edits. If the edit fails
+        (message deleted, etc.) the cached id is dropped and a fresh message is
+        sent.
+
+        Keyed by thread_ts as well so each thread keeps its own status bubble
+        rather than reaching back to edit a stale notice from another thread.
+        """
+        thread_ts = self._resolve_thread_ts(None, metadata)
+        key = (str(chat_id), str(thread_ts or ""), str(status_key))
+        cached_id = self._status_message_ids.get(key)
+        if cached_id is not None:
+            result = await self.edit_message(chat_id, cached_id, content)
+            if result.success:
+                return result
+            # Edit failed — drop the stale id and fall through to a fresh send.
+            self._status_message_ids.pop(key, None)
+        result = await self.send(chat_id, content, metadata=metadata)
+        if result.success and result.message_id:
+            self._status_message_ids[key] = str(result.message_id)
+        return result
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Show a typing/status indicator using assistant.threads.setStatus.
@@ -3019,35 +3117,96 @@ class SlackAdapter(BasePlatformAdapter):
         if not stripped.startswith("승인"):
             return False
 
-        parsed = parse_confirm(stripped)
-        if parsed is None:
-            await self._send_owner_confirm_reply(
-                channel_id,
-                thread_ts,
-                failure_response("FORMAT_MISMATCH"),
-            )
-            return True
-
         store = self._owner_confirm_store()
-        proposed = store.latest_proposed(channel=channel_id, thread_ts=thread_ts)
-        if proposed is None:
+        parsed = parse_confirm(stripped)
+
+        # Formal grammar "승인: <verb> #<token>" — strict, fully auditable path.
+        if parsed is not None:
+            proposed = store.latest_proposed(channel=channel_id, thread_ts=thread_ts)
+            if proposed is None:
+                await self._send_owner_confirm_reply(
+                    channel_id, thread_ts, failure_response("TOKEN_MISMATCH")
+                )
+                return True
+            return await self._resolve_owner_confirm(
+                proposed, parsed.verb, parsed.token,
+                channel_id=channel_id, thread_ts=thread_ts,
+                message_ts=message_ts, user_id=user_id,
+            )
+
+        # "승인:" with a bad verb/token is a malformed formal attempt (clear
+        # intent to use the gate) — guide, don't leak it into the agent loop.
+        if stripped.startswith("승인:") or stripped.startswith("승인 :"):
             await self._send_owner_confirm_reply(
-                channel_id,
-                thread_ts,
-                failure_response("TOKEN_MISMATCH"),
+                channel_id, thread_ts, failure_response("FORMAT_MISMATCH")
             )
             return True
 
+        # Bare "승인" (no verb/token) — context-aware. Resolve against the
+        # owner's own live proposals in THIS thread:
+        #   • 0 pending → not an approval; let it reach the agent (conversation).
+        #   • exactly 1 → approve it (verb/token known; no token hunting).
+        #   • 2+ → ambiguous; ask which one.
+        # The card buttons remain the unambiguous primary path regardless.
+        mine = [
+            p
+            for p in store.live_proposals(channel=channel_id, thread_ts=thread_ts)
+            if str(p.get("owner") or "") == str(user_id or "")
+        ]
+        if not mine:
+            return False
+        if len(mine) == 1:
+            p = mine[0]
+            return await self._resolve_owner_confirm(
+                p, str(p.get("confirm_verb") or ""), str(p.get("token") or ""),
+                channel_id=channel_id, thread_ts=thread_ts,
+                message_ts=message_ts, user_id=user_id,
+            )
+        await self._send_owner_confirm_reply(
+            channel_id, thread_ts, self._owner_confirm_disambiguation(mine)
+        )
+        return True
+
+    def _owner_confirm_disambiguation(self, proposals: List[Dict[str, Any]]) -> str:
+        """Ask which pending proposal a bare '승인' refers to."""
+        lines = ["대기 중인 승인 제안이 여러 건이야. 어느 거?"]
+        for p in proposals:
+            verb = str(p.get("confirm_verb") or "전송")
+            token = str(p.get("token") or "")
+            target = str(p.get("target_ref") or "").strip()
+            suffix = f" → {target}" if target else ""
+            lines.append(f"  • `승인: {verb} #{token}`{suffix}")
+        lines.append("(또는 카드의 승인 버튼을 눌러도 돼)")
+        return "\n".join(lines)
+
+    async def _resolve_owner_confirm(
+        self,
+        proposed: Dict[str, Any],
+        verb: str,
+        token: str,
+        *,
+        channel_id: str,
+        thread_ts: str,
+        message_ts: str,
+        user_id: str,
+    ) -> bool:
+        """Validate an approval against ``proposed`` and execute on success.
+
+        ``verb``/``token`` are what the approver supplied (formal path) or the
+        proposal's own values (bare-승인 path, so they always match). Owner and
+        token expiry are always enforced.
+        """
+        store = self._owner_confirm_store()
         proposal_id = str(proposed["proposal_id"])
         reject_reason = ""
         reject_detail = ""
         if str(proposed.get("owner") or "") != str(user_id or ""):
             reject_reason = "OWNER_MISMATCH"
             reject_detail = "Approver does not match proposal owner."
-        elif str(proposed.get("confirm_verb") or "") != parsed.verb:
+        elif str(proposed.get("confirm_verb") or "") != verb:
             reject_reason = "VERB_MISMATCH"
             reject_detail = "Approval verb does not match proposed action."
-        elif str(proposed.get("token") or "").upper() != parsed.token:
+        elif str(proposed.get("token") or "").upper() != str(token or "").upper():
             reject_reason = "TOKEN_MISMATCH"
             reject_detail = "Approval token does not match latest proposal."
         elif self._owner_confirm_is_expired(proposed):

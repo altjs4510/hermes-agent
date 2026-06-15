@@ -59,6 +59,18 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _is_expired(event: dict[str, Any], now: datetime) -> bool:
+    """Whether a proposal event's token TTL has elapsed by ``now``."""
+    expires_at = str(event.get("expires_at") or "")
+    if not expires_at:
+        return False
+    try:
+        parsed = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return now > parsed.astimezone(timezone.utc)
+
+
 def _iso_z(value: datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
@@ -108,6 +120,38 @@ class OwnerConfirmStore:
             ):
                 return event
         return None
+
+    def live_proposals(
+        self, *, channel: str, thread_ts: str, now: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        """Proposals in this channel+thread still awaiting confirmation.
+
+        A proposal is *live* when its most recent event is ``proposed`` (not
+        yet confirmed/rejected/executed) and its token has not expired.
+        Returned oldest-first. Used by the gateway to resolve a bare ``승인``
+        against the single obvious pending proposal in a thread.
+        """
+        now = now or _utc_now()
+        latest_by_id: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for event in self.events():
+            if event.get("channel") != channel or event.get("thread_ts") != thread_ts:
+                continue
+            pid = str(event.get("proposal_id") or "")
+            if not pid:
+                continue
+            if pid not in latest_by_id:
+                order.append(pid)
+            latest_by_id[pid] = event
+        live: list[dict[str, Any]] = []
+        for pid in order:
+            event = latest_by_id[pid]
+            if event.get("state") != "proposed":
+                continue
+            if _is_expired(event, now):
+                continue
+            live.append(event)
+        return live
 
     def _append_unlocked(self, event: dict[str, Any]) -> dict[str, Any]:
         self.path.parent.mkdir(parents=True, exist_ok=True)
