@@ -20,8 +20,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from tools.registry import registry, tool_error, tool_result
 
 
-MY_ALTER_PROJECTS = Path(os.path.expanduser("~/.my-alter/projects"))
-WORLD_PROJECTS = Path(os.path.expanduser("~/.claude/knowledge/world/projects.json"))
+MY_ALTER_PROJECTS = Path(os.path.expanduser("~/.hermes/knowledge/projects"))  # 2026-06-11 my-alter→hermes 흡수
+WORLD_PROJECTS = Path(os.path.expanduser("~/.hermes/knowledge/world/projects.json"))
 
 
 def _expand(path: str | None) -> str | None:
