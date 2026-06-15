@@ -92,9 +92,10 @@ def _add(args: dict) -> str:
         {"column_id": _env("COOKIE_TODO_COL_TITLE"), "rich_text": _rich_text(title)},
         {"column_id": _env("COOKIE_TODO_COL_STATUS"), "select": [status]},
     ]
-    project = (args.get("project") or "").strip()
-    if project:
-        fields.append({"column_id": _env("COOKIE_TODO_COL_PROJECT"), "select": [project]})
+    # 주제(topic): 2026-06-10 select→text 전환. accept both `topic`(new) and `project`(legacy) arg keys.
+    topic = (args.get("topic") or args.get("project") or "").strip()
+    if topic:
+        fields.append({"column_id": _env("COOKIE_TODO_COL_PROJECT"), "rich_text": _rich_text(topic)})
     due = (args.get("due") or "").strip()
     if due:
         fields.append({"column_id": _env("COOKIE_TODO_COL_DUE"), "date": [due]})
@@ -119,7 +120,7 @@ def _add(args: dict) -> str:
     return json.dumps({
         "ok": True, "action": "add", "title": title,
         "id": item.get("id"), "status": status,
-        "project": project or None, "due": due or None,
+        "topic": topic or None, "due": due or None,
     }, ensure_ascii=False)
 
 
@@ -139,10 +140,12 @@ def _list(args: dict) -> str:
         if not include_done and (done or status == "done"):
             continue
         title_f = fields.get(_env("COOKIE_TODO_COL_TITLE"), {})
+        topic_f = fields.get(_env("COOKIE_TODO_COL_PROJECT"), {})
         out.append({
             "id": it.get("id"),
             "title": title_f.get("text") or "",
             "status": status,
+            "topic": topic_f.get("text") or None,
         })
     return json.dumps({"ok": True, "action": "list", "open": len(out), "items": out},
                       ensure_ascii=False)
@@ -224,9 +227,13 @@ SLACK_LIST_TODO_SCHEMA = {
                 "enum": ["not_started", "in_progress", "done", "stopped"],
                 "description": "Status for add (default not_started)",
             },
+            "topic": {
+                "type": "string",
+                "description": "Optional 주제 (freeform topic label, NOT a fixed enum — 2026-06-10 select→text). Write a short natural theme that groups the item, e.g. 'DCS AI', '사업부 지원', '알터·도구', '파트 미팅', '노션 정비'. Project identity SoT is projects.yaml; this is just a grouping label. (legacy arg key `project` still accepted)",
+            },
             "project": {
                 "type": "string",
-                "description": "Optional project tag value (e.g. dcs_ai, biz_support, alter_tools, robot, intern, etc)",
+                "description": "DEPRECATED alias for `topic` (kept for back-compat). Prefer `topic`.",
             },
             "due": {"type": "string", "description": "Optional due date YYYY-MM-DD"},
             "priority": {
