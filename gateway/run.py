@@ -15594,7 +15594,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if progress_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
-            
+
             # Build progress message with primary argument preview
             from agent.display import get_tool_emoji
             emoji = get_tool_emoji(tool_name, default="⚙️")
@@ -15873,11 +15873,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             while True:
                 try:
                     if not _run_still_current():
+                        # Drain remaining queued tool lines, then flush a final
+                        # edit before exiting. Normal turn completion can retire
+                        # this run's generation while a throttle-deferred edit is
+                        # still pending (the last tool line was appended to
+                        # progress_lines but not yet written). Without this flush
+                        # the bubble freezes on the first tool it managed to send
+                        # (e.g. "🗒️ slack_list_todo…") and never shows the rest —
+                        # mirrors the CancelledError drain path below.
                         while not progress_queue.empty():
                             try:
-                                progress_queue.get_nowait()
+                                raw = progress_queue.get_nowait()
                             except Exception:
                                 break
+                            if isinstance(raw, str):
+                                progress_lines.append(raw)
+                        if can_edit and progress_lines and progress_msg_id:
+                            try:
+                                await _roll_progress_overflow_if_needed()
+                                await _edit_progress_message(
+                                    progress_msg_id, _progress_text(progress_lines)
+                                )
+                            except Exception:
+                                pass
                         return
 
                     raw = progress_queue.get_nowait()
