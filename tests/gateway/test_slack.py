@@ -2935,6 +2935,106 @@ class TestThreadReplyHandling:
         assert "승인 형식 불일치" in adapter_with_session_store._app.client.chat_postMessage.call_args.kwargs["text"]
 
     @pytest.mark.asyncio
+    async def test_bare_seungin_without_pending_proposal_reaches_agent(
+        self, adapter_with_session_store, mock_session_store, tmp_path
+    ):
+        """A conversational bare '승인' with no live proposal is NOT eaten by the gate.
+
+        The bot may ask '승인해주면 진행할게' in plain language; the owner's '승인'
+        must reach the agent loop, not get a format-mismatch rejection.
+        (FNF #C0ANUN2AQER, 2026-06-08 — Option B.)
+        """
+        audit_path = tmp_path / "owner-confirm.jsonl"
+        adapter_with_session_store.config.extra["owner_confirm_audit_path"] = str(audit_path)
+        adapter_with_session_store._app.client.chat_postMessage = AsyncMock(return_value={"ts": "reply"})
+
+        handled = await adapter_with_session_store._handle_owner_confirm_message(
+            text="승인",
+            channel_id="C123",
+            thread_ts="123.000",
+            message_ts="123.456",
+            user_id="U_OWNER",
+        )
+
+        assert handled is False
+        adapter_with_session_store._app.client.chat_postMessage.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bare_seungin_approves_single_live_proposal(
+        self, adapter_with_session_store, mock_session_store, tmp_path
+    ):
+        """Bare '승인' approves the one obvious pending proposal in the thread."""
+        audit_path = tmp_path / "owner-confirm.jsonl"
+        adapter_with_session_store.config.extra["owner_confirm_audit_path"] = str(audit_path)
+        proposed = OwnerConfirmStore(audit_path).propose(
+            channel="C123",
+            thread_ts="123.000",
+            actor="U_BOT",
+            owner="U_OWNER",
+            action_class="send",
+            confirm_verb="전송",
+            token="A17F",
+            target_ref="slack:channel:C123|msg:draft",
+            preview_ref="artifact://preview/1",
+        )
+        adapter_with_session_store._app.client.chat_postMessage = AsyncMock(return_value={"ts": "confirm_reply"})
+        executor = AsyncMock(return_value={"result": "success", "result_code": "OK"})
+        adapter_with_session_store._owner_confirm_executors = {proposed["proposal_id"]: executor}
+
+        handled = await adapter_with_session_store._handle_owner_confirm_message(
+            text="승인",
+            channel_id="C123",
+            thread_ts="123.000",
+            message_ts="123.456",
+            user_id="U_OWNER",
+        )
+
+        assert handled is True
+        executor.assert_awaited_once()
+        records = OwnerConfirmStore(audit_path).lookup(proposed["proposal_id"])
+        assert [r["state"] for r in records] == ["proposed", "confirmed", "executed"]
+
+    @pytest.mark.asyncio
+    async def test_bare_seungin_with_multiple_live_proposals_asks_which(
+        self, adapter_with_session_store, mock_session_store, tmp_path
+    ):
+        """Bare '승인' with 2+ pending proposals disambiguates instead of guessing."""
+        audit_path = tmp_path / "owner-confirm.jsonl"
+        adapter_with_session_store.config.extra["owner_confirm_audit_path"] = str(audit_path)
+        store = OwnerConfirmStore(audit_path)
+        p1 = store.propose(
+            channel="C123", thread_ts="123.000", actor="U_BOT", owner="U_OWNER",
+            action_class="send", confirm_verb="전송", token="A17F",
+            target_ref="slack:channel:C123", preview_ref="artifact://preview/1",
+        )
+        p2 = store.propose(
+            channel="C123", thread_ts="123.000", actor="U_BOT", owner="U_OWNER",
+            action_class="send", confirm_verb="수정", token="B2C1",
+            target_ref="notion:page:xyz", preview_ref="artifact://preview/2",
+        )
+        adapter_with_session_store._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ask_reply"})
+        e1 = AsyncMock(return_value={"result": "success", "result_code": "OK"})
+        e2 = AsyncMock(return_value={"result": "success", "result_code": "OK"})
+        adapter_with_session_store._owner_confirm_executors = {
+            p1["proposal_id"]: e1, p2["proposal_id"]: e2,
+        }
+
+        handled = await adapter_with_session_store._handle_owner_confirm_message(
+            text="승인",
+            channel_id="C123",
+            thread_ts="123.000",
+            message_ts="123.456",
+            user_id="U_OWNER",
+        )
+
+        assert handled is True
+        e1.assert_not_called()
+        e2.assert_not_called()
+        reply = adapter_with_session_store._app.client.chat_postMessage.call_args.kwargs["text"]
+        assert "여러 건" in reply
+        assert "#A17F" in reply and "#B2C1" in reply
+
+    @pytest.mark.asyncio
     async def test_owner_confirm_send_metadata_posts_preview_then_confirm_sends_actual(
         self, adapter_with_session_store, mock_session_store, tmp_path
     ):
