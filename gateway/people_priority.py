@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 # Roster locations, in preference order. Same file in both; the jarvis
 # knowledge dir is canonical, the alter dir is a mirror.
 _PEOPLE_PATHS = [
-    Path.home() / ".claude" / "knowledge" / "world" / "people.json",
-    Path.home() / ".my-alter" / "people.json",
+    Path.home() / ".hermes" / "knowledge" / "world" / "people.json",
+    Path.home() / ".hermes" / "knowledge" / "world" / "people.json",  # mirror (was .claude symlink)
 ]
 
 # Returned when the requester isn't in the roster.
