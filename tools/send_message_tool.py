@@ -2495,7 +2495,7 @@ def _check_update_message():
 
 
 # --- Registry ---
-from tools.registry import tool_error
+from tools.registry import registry, tool_error
 
 # NOTE (upstream): upstream intentionally does NOT register ``send_message`` as
 # an agent-callable model tool. For the Cookie alter deployment we DO register
