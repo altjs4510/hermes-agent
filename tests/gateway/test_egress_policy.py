@@ -104,6 +104,16 @@ def test_tainted_exec_confirms():
     assert d.rule_id == "egress:tainted-exec"
 
 
+def test_exec_under_private_only_taint_is_local_allow():
+    # "Guard the outer door only" (2026-06-15): exec after a non-external read
+    # has no injection carrier, so it is treated as a local action — allow with
+    # a low-risk audit signal, not a confirm prompt.
+    d = evaluate_egress(ACTOR, "exec", "python3 /tmp/x.py", _internal(), {})
+    assert d.action == "allow"
+    assert d.rule_id == "egress:tainted-exec-local"
+    assert d.risk_level == "low"
+
+
 def test_tainted_local_write_allowed_not_blocked():
     # Local drafts/specs are normal; Phase 1 does not blanket-block writes.
     d = evaluate_egress(ACTOR, "write", "/tmp/draft.md", _external(), {})
