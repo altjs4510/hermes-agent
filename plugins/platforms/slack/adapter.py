@@ -1350,7 +1350,6 @@ class SlackAdapter(BasePlatformAdapter):
             # 네이티브 "리스트에 추가"와 같은 List 에 행을 만들되 *즉시* 정리:
             # link 칸에 permalink → enricher 를 detached 로 바로 실행(event-loop 비점유).
             # 네이티브 경로는 2분 cron 이 잡고, 숏컷은 클릭 즉시.
-            @self._app.shortcut("cookie_wiki_save")
             async def handle_wiki_save_shortcut(ack, shortcut, client):
                 await ack()
                 try:
@@ -1401,6 +1400,13 @@ class SlackAdapter(BasePlatformAdapter):
                             pass
                 except Exception as e:  # pragma: no cover - defensive
                     logger.exception("[wiki_save] failed: %s", e)
+
+            # Register the shortcut only when the Slack app supports it. Some
+            # test doubles / minimal app objects don't expose ``.shortcut``;
+            # guarding here keeps connect() robust instead of failing the whole
+            # connection on a missing optional handler.
+            if hasattr(self._app, "shortcut"):
+                self._app.shortcut("cookie_wiki_save")(handle_wiki_save_shortcut)
 
             # Bring up the handler and watchdog atomically. ``_running`` only
             # flips to True after the handler is alive so the watchdog loop
