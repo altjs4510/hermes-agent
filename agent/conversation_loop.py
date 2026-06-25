@@ -2804,10 +2804,23 @@ def run_conversation(
                     # still recover.  See _pool_may_recover_from_rate_limit
                     # for the single-credential-pool and CloudCode-quota
                     # exceptions.  Fixes #11314 and #13636.
-                    pool_may_recover = _ra()._pool_may_recover_from_rate_limit(
-                        agent._credential_pool,
-                        provider=agent.provider,
-                        base_url=getattr(agent, "base_url", None),
+                    #
+                    # Billing exhaustion is the exception: it is account-level
+                    # (a depleted credit balance, not a transient time-based
+                    # rate limit) so the pool can never "recover" by waiting,
+                    # and credential rotation was already attempted above
+                    # (_recover_with_credential_pool).  Letting the rate-limit
+                    # recovery heuristic gate it makes the agent thrash on the
+                    # dead provider instead of failing over to the configured
+                    # fallback (e.g. Bedrock).  So for billing, always proceed
+                    # to fallback.
+                    pool_may_recover = (
+                        classified.reason != FailoverReason.billing
+                        and _ra()._pool_may_recover_from_rate_limit(
+                            agent._credential_pool,
+                            provider=agent.provider,
+                            base_url=getattr(agent, "base_url", None),
+                        )
                     )
                     if not pool_may_recover:
                         if classified.reason == FailoverReason.billing:
