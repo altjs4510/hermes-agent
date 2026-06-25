@@ -61,6 +61,7 @@ from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
+from agent.current_agent import set_current_agent
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
@@ -531,6 +532,11 @@ def run_conversation(
     # ``build_turn_context``.  It mutates ``agent`` exactly as the inline code
     # did and returns the locals the loop below reads back.  See
     # ``agent/turn_context.py``.
+    # Bind the active agent to this turn's context so tool handlers can reach it
+    # (e.g. governed-skill tool re-grant in skills_tool). Propagates to the
+    # tool-executor threads like skill_provenance. Overwritten each turn.
+    set_current_agent(agent)
+
     _ctx = build_turn_context(
         agent,
         user_message,

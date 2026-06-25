@@ -1603,6 +1603,113 @@ registry.register(
     check_fn=check_skills_requirements,
     emoji="📚",
 )
+# ── Governed-skill tool re-grant (permissions.md §9) ───────────────────────
+# When an authorized requester loads a governance-registered skill via
+# skill_view, re-grant that skill's declared `governance.tool_scope` onto the
+# live agent — a tier-drop exception scoped to THIS turn (the agent re-inits per
+# turn, so the grant evaporates next turn; no explicit revoke). This implements
+# "saw the governed skill + requester is allowed → just proceed", instead of the
+# crude "non-owner → write dropped → defer to owner". Off by default; flip
+# HERMES_GOVERNED_TOOL_GRANT=1 to enable. The skill's arg_policy (judge) remains
+# the per-invocation guardrail inside the skill flow.
+def _governed_requester_in_triggerers(requester, triggerers):
+    """requester(slack_id) ∈ resolved(triggerers). Groups resolve via env:
+    owner=HERMES_OWNER_IDS, executive=HERMES_EXECUTIVE_IDS, custom group <g> =
+    HERMES_GROUP_<G> (e.g. app_part_members → HERMES_GROUP_APP_PART_MEMBERS)."""
+    import os
+
+    def _ids(env):
+        return {x.strip() for x in os.getenv(env, "").split(",") if x.strip()}
+
+    for grp in triggerers or []:
+        if grp == "owner" and requester in _ids("HERMES_OWNER_IDS"):
+            return True
+        if grp == "executive" and requester in _ids("HERMES_EXECUTIVE_IDS"):
+            return True
+        if requester in _ids("HERMES_GROUP_" + str(grp).upper()):
+            return True
+    return False
+
+
+def _load_skill_governance(skill_name):
+    """metadata.hermes.governance dict from the skill's SKILL.md frontmatter, or None."""
+    import os
+    import glob
+    try:
+        import yaml
+    except Exception:
+        return None
+    base = os.path.expanduser("~/.hermes/skills")
+    for p in glob.glob(os.path.join(base, "**", "SKILL.md"), recursive=True):
+        try:
+            txt = open(p, encoding="utf-8").read()
+        except Exception:
+            continue
+        if not txt.startswith("---"):
+            continue
+        end = txt.find("\n---", 3)
+        if end == -1:
+            continue
+        try:
+            fm = yaml.safe_load(txt[3:end])
+        except Exception:
+            continue
+        if not isinstance(fm, dict):
+            continue
+        nm = fm.get("name") or os.path.basename(os.path.dirname(p))
+        if nm != skill_name:
+            continue
+        gov = ((fm.get("metadata") or {}).get("hermes") or {}).get("governance")
+        return gov if isinstance(gov, dict) else None
+    return None
+
+
+def _maybe_grant_governed_tools(skill_name):
+    """Re-grant a governed skill's tool_scope onto the live agent for this turn.
+    Best-effort; never raises into skill_view. See module note above."""
+    import os
+    import logging
+
+    if os.getenv("HERMES_GOVERNED_TOOL_GRANT", "0") != "1":
+        return
+    try:
+        from agent.current_agent import get_current_agent
+        agent = get_current_agent()
+        if agent is None or not getattr(agent, "tools", None):
+            return
+        requester = getattr(agent, "_user_id", None)
+        if not requester:
+            return
+        gov = _load_skill_governance(skill_name)
+        if not gov:
+            return
+        if not _governed_requester_in_triggerers(requester, gov.get("triggerers")):
+            return
+        valid = getattr(agent, "valid_tool_names", None)
+        if valid is None:
+            return
+        from tools.registry import registry
+        granted = []
+        for tn in (gov.get("tool_scope") or []):
+            if tn in valid:
+                continue
+            schema = registry.get_schema(tn)
+            if not schema:
+                continue
+            agent.tools.append({"type": "function", "function": {**schema, "name": tn}})
+            valid.add(tn)
+            granted.append(tn)
+        if granted:
+            logging.getLogger(__name__).info(
+                "governed-tool-grant: skill=%s requester=%s granted=%s (this turn)",
+                skill_name, requester, granted,
+            )
+    except Exception:
+        logging.getLogger(__name__).exception(
+            "governed-tool-grant failed (skill=%s) — no grant", skill_name
+        )
+
+
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count on success. Best-effort: a
     telemetry failure never breaks the tool call."""
@@ -1623,6 +1730,8 @@ def _skill_view_with_bump(args, **kw):
                 # to act on it — that counts as use, not just a browse/view.
                 # Curator's stale timer keys off last_used_at (see agent/curator.py).
                 bump_use(str(resolved))
+                # Governed-skill tool re-grant (permissions.md §9; flag-gated).
+                _maybe_grant_governed_tools(str(resolved))
     except Exception:
         pass
     return result
