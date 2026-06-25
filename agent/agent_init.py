@@ -1230,6 +1230,25 @@ def init_agent(
             if agent.ephemeral_system_prompt else _access_note
         )
 
+    # Deterministic requester identity injection (people.yaml single source via
+    # HERMES_PEOPLE_FILE). Joins the inbound sender against the people directory so
+    # the agent knows WHO/which-part the requester is for free — no search_files to
+    # find out. Runs for every inbound with a resolvable sender (owner included).
+    # ~one line of context; net token-negative (replaces a search round-trip).
+    # See permissions.md §9. Best-effort: never breaks agent init.
+    if _uid:
+        try:
+            from agent.people_directory import identity_line as _identity_line
+            _idline = _identity_line(_uid)
+            if _idline:
+                _id_note = f"요청자(이 메시지 발신자): {_idline} · slack {_uid}"
+                agent.ephemeral_system_prompt = (
+                    (agent.ephemeral_system_prompt + "\n\n" + _id_note).strip()
+                    if agent.ephemeral_system_prompt else _id_note
+                )
+        except Exception:
+            pass
+
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
     if agent.tools:
