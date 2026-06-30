@@ -630,12 +630,19 @@ class TestSendMessageTool:
         _ensure_slack_mock(monkeypatch)
         monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-cookie")
         slack_cfg = SimpleNamespace(enabled=True, token="xoxb-test", extra={})
-        send_mock = AsyncMock(side_effect=[
-            {"error": "Slack API error: channel_not_found", "slack_error": "channel_not_found"},
-            {"success": True, "platform": "slack", "chat_id": "C123ABCDEF", "message_id": "177.1"},
-        ])
+        bot_send_mock = AsyncMock(return_value={
+            "error": "Slack API error: channel_not_found",
+            "slack_error": "channel_not_found",
+        })
+        user_send_mock = AsyncMock(return_value={
+            "success": True,
+            "platform": "slack",
+            "chat_id": "C123ABCDEF",
+            "message_id": "177.1",
+        })
 
-        with patch("tools.send_message_tool._send_slack", new=send_mock), \
+        with _patch_slack_standalone_sender(bot_send_mock), \
+             patch("tools.send_message_tool._send_slack", new=user_send_mock), \
              patch("tools.send_message_tool._request_slack_user_token_fallback_approval", return_value=(True, None)) as approval_mock:
             result = asyncio.run(
                 _send_to_platform(
@@ -654,25 +661,31 @@ class TestSendMessageTool:
         assert result["bot_token_error"] == "channel_not_found"
         assert result["mirror_text"] == "hello\n\n— sent by Cookie via cookie.hermes"
         approval_mock.assert_called_once()
-        assert send_mock.await_args_list[0].args == ("xoxb-test", "C123ABCDEF", "hello")
-        assert send_mock.await_args_list[0].kwargs == {"thread_id": "171.000001"}
-        assert send_mock.await_args_list[1].args == (
+        bot_send_mock.assert_awaited_once_with(
+            "xoxb-test",
+            "C123ABCDEF",
+            "hello",
+            thread_ts="171.000001",
+        )
+        user_send_mock.assert_awaited_once_with(
             "xoxp-cookie",
             "C123ABCDEF",
             "hello\n\n— sent by Cookie via cookie.hermes",
+            thread_id="171.000001",
         )
-        assert send_mock.await_args_list[1].kwargs == {"thread_id": "171.000001"}
 
     def test_slack_user_token_fallback_denied_returns_original_error(self, monkeypatch):
         _ensure_slack_mock(monkeypatch)
         monkeypatch.setenv("SLACK_USER_TOKEN", "xoxp-cookie")
         slack_cfg = SimpleNamespace(enabled=True, token="xoxb-test", extra={})
-        send_mock = AsyncMock(return_value={
+        bot_send_mock = AsyncMock(return_value={
             "error": "Slack API error: not_in_channel",
             "slack_error": "not_in_channel",
         })
+        user_send_mock = AsyncMock(return_value={"success": True})
 
-        with patch("tools.send_message_tool._send_slack", new=send_mock), \
+        with _patch_slack_standalone_sender(bot_send_mock), \
+             patch("tools.send_message_tool._send_slack", new=user_send_mock), \
              patch("tools.send_message_tool._request_slack_user_token_fallback_approval", return_value=(False, "denied")):
             result = asyncio.run(
                 _send_to_platform(
@@ -690,7 +703,13 @@ class TestSendMessageTool:
         assert result["user_token_fallback_available"] is True
         assert result["approval_required"] is True
         assert result["fallback_error"] == "denied"
-        assert send_mock.await_count == 1
+        bot_send_mock.assert_awaited_once_with(
+            "xoxb-test",
+            "C123ABCDEF",
+            "hello",
+            thread_ts="171.000001",
+        )
+        user_send_mock.assert_not_awaited()
 
     def test_slack_person_name_normalization_strips_honorifics(self):
         assert _normalize_slack_person_query("로이봉 이사님") == "로이봉"
@@ -990,7 +1009,7 @@ class TestSendToPlatformChunking:
             "***",
             "C123",
             "*hello* from <https://example.com|Hermes>",
-            thread_id=None,
+            thread_ts=None,
         )
 
     def test_slack_bold_italic_formatted_before_send(self, monkeypatch):
