@@ -872,6 +872,84 @@ async def _cancel_socket_tasks(tasks: Any) -> None:
         )
 
 
+# Coroutine names inside SocketModeClient that can sit in connect()'s retry loop.
+_SOCKET_CLIENT_COROS = frozenset(
+    {
+        "connect",
+        "connect_to_new_endpoint",
+        "monitor_current_session",
+        "receive_messages",
+        "process_messages",
+    }
+)
+
+
+def _coro_self(task: Any) -> Any:
+    """Return the ``self`` bound to a task's currently executing coroutine."""
+    get_coro = getattr(task, "get_coro", None)
+    coro = get_coro() if callable(get_coro) else None
+    while coro is not None:
+        frame = getattr(coro, "cr_frame", None)
+        if frame is not None:
+            owner = (getattr(frame, "f_locals", None) or {}).get("self")
+            if owner is not None:
+                return owner
+        # An awaiting coroutine delegates to the one it awaits; follow the chain.
+        coro = getattr(coro, "cr_await", None)
+    return None
+
+
+async def _cancel_orphaned_client_tasks(client: Any) -> int:
+    """Cancel leftover tasks still bound to a torn-down SocketModeClient.
+
+    Why this exists: ``_stop_socket_mode_handler`` cancels a *snapshot* of the
+    client's task attributes, but ``SocketModeClient.connect()`` rebinds those
+    attributes with fresh ``ensure_future`` tasks on success. A task created
+    after the snapshot is taken -- during the awaits inside ``close()`` -- is
+    never cancelled, and if it is parked in ``connect()`` it spins forever:
+    that loop is ``while True`` with no ``self.closed`` check
+    (slack_sdk/socket_mode/aiohttp ``connect``), so every retry hits the closed
+    shared session and logs ``RuntimeError: Session is closed`` once per
+    ``ping_interval`` (10s via slack_bolt) until the process dies. The new
+    handler keeps working, so inbound never breaks -- it is pure log noise plus
+    a zombie task, which is why it went unnoticed for hours at a time.
+
+    Upstream still reproduces this (NousResearch/hermes-agent#14326,
+    slackapi/python-slack-sdk#1913), so the sweep lives here rather than
+    waiting for a fix to arrive by merge.
+    """
+    if client is None:
+        return 0
+
+    orphans = []
+    try:
+        current = asyncio.current_task()
+        for task in asyncio.all_tasks():
+            if task is current or task.done():
+                continue
+            coro = task.get_coro() if callable(getattr(task, "get_coro", None)) else None
+            name = getattr(coro, "__name__", None) or getattr(
+                getattr(coro, "cr_code", None), "co_name", None
+            )
+            if name not in _SOCKET_CLIENT_COROS:
+                continue
+            if _coro_self(task) is not client:
+                continue
+            orphans.append(task)
+    except RuntimeError:  # pragma: no cover - no running loop
+        return 0
+
+    if not orphans:
+        return 0
+
+    logger.warning(
+        "[Slack] Cancelling %d orphaned Socket Mode task(s) left on the old client",
+        len(orphans),
+    )
+    await _cancel_socket_tasks(orphans)
+    return len(orphans)
+
+
 _SLACK_PROXY_HOSTS = (
     "slack.com",
     "files.slack.com",
@@ -1396,6 +1474,13 @@ class SlackAdapter(BasePlatformAdapter):
                     e,
                     exc_info=True,
                 )
+
+        # close() rebinds client task attributes across its awaits, so the
+        # snapshot above can miss a task created partway through teardown. Sweep
+        # once more by walking the live task set: anything still bound to this
+        # client is an orphan that would retry against the closed session
+        # forever. See _cancel_orphaned_client_tasks.
+        await _cancel_orphaned_client_tasks(client)
 
     async def _socket_transport_connected(self) -> Optional[bool]:
         """Best-effort check of current Socket Mode transport state."""

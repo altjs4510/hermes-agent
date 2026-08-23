@@ -299,6 +299,64 @@ class TestSocketModeTeardown:
         )
 
     @pytest.mark.asyncio
+    async def test_task_rebound_during_close_does_not_survive(self, adapter):
+        """A task created *during* teardown must not outlive it.
+
+        The snapshot the adapter cancels is taken before close_async() runs, but
+        SocketModeClient.connect() rebinds current_session_monitor and
+        message_receiver to fresh tasks whenever it succeeds. A task that
+        appears in that window is in no snapshot, so nothing cancels it -- and
+        if it is parked in connect() it spins forever, because that loop is
+        ``while True`` with no closed check. Every retry hits the dead shared
+        session and logs "Session is closed" once per ping_interval until the
+        process is restarted.
+
+        Observed in production 2026-08-20/21: one wedged loop produced a steady
+        6 errors/min for ~2 hours while inbound messages kept working normally,
+        so nothing but the log noise revealed it. Upstream still reproduces
+        (NousResearch/hermes-agent#14326, slackapi/python-slack-sdk#1913).
+        """
+
+        class _RebindingClient(_FakeSocketModeClient):
+            """Recreates the task attribute mid-teardown, like connect() does."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.orphan = None
+
+            async def close(self) -> None:
+                self.closed = True
+                # Slips in after the adapter took its snapshot.
+                self.orphan = asyncio.create_task(self.connect())
+                await asyncio.sleep(0)  # let it reach the retry loop
+                await self.aiohttp_client_session.close()
+
+        handler = _FakeHandler()
+        handler.client = _RebindingClient()
+        client = handler.client
+
+        _attach(adapter, handler)
+        await asyncio.sleep(0.01)
+
+        await adapter._stop_socket_mode_handler()
+        await asyncio.sleep(0.03)
+
+        assert client.orphan is not None, "test did not exercise the rebind path"
+        assert client.orphan.done(), (
+            "a task rebound during close() outlived teardown and will retry "
+            "against the closed session forever"
+        )
+
+        # The real symptom is unbounded growth, so assert it actually stopped.
+        before = client.aiohttp_client_session.ws_connect_after_close
+        await asyncio.sleep(0.05)
+        after = client.aiohttp_client_session.ws_connect_after_close
+        assert after == before, (
+            "retries against the closed session are still accumulating "
+            f"({before} -> {after})"
+        )
+
+    @pytest.mark.asyncio
     async def test_stop_clears_adapter_state(self, adapter):
         """Teardown always drops its references, even when close_async() raises."""
         handler = _FakeHandler()
