@@ -914,9 +914,17 @@ async def _cancel_orphaned_client_tasks(client: Any) -> int:
     handler keeps working, so inbound never breaks -- it is pure log noise plus
     a zombie task, which is why it went unnoticed for hours at a time.
 
-    Upstream still reproduces this (NousResearch/hermes-agent#14326,
-    slackapi/python-slack-sdk#1913), so the sweep lives here rather than
-    waiting for a fix to arrive by merge.
+    Upstream tracks the same bug in NousResearch/hermes-agent#46990 (root cause:
+    slackapi/python-slack-sdk#1913), and PR #83693 there fixes it by re-reading
+    the three client task attributes for up to 3 passes after ``close_async()``.
+
+    ⚠️ CONVERGENCE PLAN (2026-08-24): **drop this local sweep once #83693 merges**
+    and take the upstream implementation, to stop widening our fork's diff on
+    this file. The one behavioural difference is that attribute re-reading only
+    finds an orphan while it is still referenced by one of those attributes,
+    whereas this sweep is reachability-independent; that difference was raised on
+    the PR and is not worth carrying a fork for on its own. Our regression test
+    for the rebind window is offered upstream as RelaxJonh/hermes-agent#1.
     """
     if client is None:
         return 0
