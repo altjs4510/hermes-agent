@@ -135,6 +135,8 @@ def build_oss_config(flags: dict[str, str]) -> tuple[dict, dict[str, str]]:
     llm_def = LLM_PROVIDERS[llm_id]
     llm_model = flags.get("oss_llm_model") or llm_def["default_model"]
     llm_config: dict[str, Any] = {"model": llm_model}
+    if llm_id == "openai" and llm_model == "gpt-5-mini":
+        llm_config["is_reasoning_model"] = True
     llm_url = flags.get("oss_llm_url") or llm_def.get("default_url")
     if llm_url and llm_def.get("base_url_key"):
         llm_config[llm_def["base_url_key"]] = llm_url
@@ -863,11 +865,17 @@ def _install_provider_deps(llm_id: str, embedder_id: str, vector_id: str) -> Non
     for dep in sorted(deps):
         try:
             print(f"  Installing {dep}...")
-            subprocess.run(
-                ["uv", "pip", "install", "--python", sys.executable, dep],
-                capture_output=True, timeout=60,
-            )
-            print(f"  ✓ Installed {dep}")
+            # Environment-aware install: sealed hosted venvs redirect to the
+            # durable data-volume target instead of /opt/hermes (NS-605).
+            from tools.lazy_deps import install_specs
+
+            outcome = install_specs([dep], timeout=60)
+            if outcome.ok:
+                print(f"  ✓ Installed {dep}")
+            elif outcome.blocked:
+                print(f"  Warning: cannot install {dep}: {outcome.reason}")
+            else:
+                print(f"  Warning: Could not install {dep}. Install manually: uv pip install {dep}")
         except Exception:
             print(f"  Warning: Could not install {dep}. Install manually: uv pip install {dep}")
     if deps:

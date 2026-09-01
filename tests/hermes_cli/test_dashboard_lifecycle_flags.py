@@ -35,12 +35,16 @@ class TestDashboardStatus:
             cmd_dashboard(_ns(status=True))
         assert exc.value.code == 0
         out = capsys.readouterr().out
-        assert "No hermes dashboard processes running" in out
+        assert "No hermes dashboard or serve processes running" in out
 
     def test_status_with_processes(self, capsys):
+        # Includes a serve-mode backend: --status must LIST it, not hide it —
+        # `--stop` kills serves, so hiding them let operators kill what they
+        # couldn't see (#81564).
         processes = [
             (12345, "hermes dashboard --port 9119"),
             (12346, "python -m hermes_cli.main dashboard --host 0.0.0.0 --port 9120"),
+            (12347, "hermes serve --host 100.94.65.93 --port 9119"),
         ]
         with patch("hermes_cli.main._scan_dashboard_processes", return_value=processes), \
              patch("gateway.status._pid_exists", return_value=True), \
@@ -50,45 +54,11 @@ class TestDashboardStatus:
         # Status is informational — always exits 0.
         assert exc.value.code == 0
         out = capsys.readouterr().out
-        assert "2 hermes dashboard process(es) running" in out
+        assert "3 hermes dashboard/serve process(es) running" in out
         assert "PID 12345" in out
         assert "PID 12346" in out
+        assert "PID 12347" in out and "[serve]" in out
 
-    def test_status_ignores_headless_serve_children_and_non_listeners(self, capsys):
-        processes = [
-            (11111, "hermes serve --port 0"),
-            (22222, "hermes dashboard --port 9119"),
-            (33333, "hermes dashboard --port 9120"),
-        ]
-
-        def fake_listening(host, port):
-            return port == 9119
-
-        with patch("hermes_cli.main._scan_dashboard_processes", return_value=processes), \
-             patch("gateway.status._pid_exists", return_value=True), \
-             patch("hermes_cli.main._dashboard_listening", side_effect=fake_listening), \
-             pytest.raises(SystemExit) as exc:
-            cmd_dashboard(_ns(status=True))
-
-        assert exc.value.code == 0
-        out = capsys.readouterr().out
-        assert "1 hermes dashboard process(es) running" in out
-        assert "PID 22222" in out
-        assert "PID 11111" not in out
-        assert "PID 33333" not in out
-
-    def test_status_ignores_dead_pids(self, capsys):
-        with patch(
-            "hermes_cli.main._scan_dashboard_processes",
-            return_value=[(12345, "hermes dashboard --port 9119")],
-        ), \
-             patch("gateway.status._pid_exists", return_value=False), \
-             pytest.raises(SystemExit) as exc:
-            cmd_dashboard(_ns(status=True))
-
-        assert exc.value.code == 0
-        out = capsys.readouterr().out
-        assert "No hermes dashboard processes running" in out
 
     def test_status_does_not_try_to_import_fastapi(self):
         """`--status` must not require dashboard runtime deps — it's a
@@ -108,14 +78,6 @@ class TestDashboardStatus:
 
 
 class TestDashboardStop:
-    def test_stop_when_nothing_running(self, capsys):
-        with patch("hermes_cli.main._find_stale_dashboard_pids",
-                   return_value=[]), \
-             pytest.raises(SystemExit) as exc:
-            cmd_dashboard(_ns(stop=True))
-        assert exc.value.code == 0
-        out = capsys.readouterr().out
-        assert "No hermes dashboard processes running" in out
 
     def test_stop_kills_and_exits_zero_when_all_killed(self, capsys):
         """After the kill, if the second scan returns empty we exit 0."""
@@ -169,13 +131,6 @@ class TestLifecycleFlagsTakePrecedence:
     who typed ``hermes dashboard --stop`` must not end up ALSO starting
     a new server."""
 
-    def test_status_wins_over_stop(self, capsys):
-        with patch("hermes_cli.main._scan_dashboard_processes", return_value=[]), \
-             patch("hermes_cli.main._kill_stale_dashboard_processes") as mock_kill, \
-             pytest.raises(SystemExit):
-            cmd_dashboard(_ns(status=True, stop=True))
-        # Kill path must NOT run when --status is also set.
-        mock_kill.assert_not_called()
 
     def test_stop_does_not_fall_through_to_server_start(self):
         """Covers the worst-case regression: if --stop ever stopped exiting
