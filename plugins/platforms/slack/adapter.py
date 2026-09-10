@@ -875,6 +875,9 @@ async def _cancel_socket_tasks(tasks: Any) -> None:
 # Coroutine names inside SocketModeClient that can sit in connect()'s retry loop.
 _SOCKET_CLIENT_COROS = frozenset(
     {
+        # ``connect`` is the SDK's retry loop.  It can be spawned directly
+        # during the close/rebind window, not only through one of the wrapper
+        # coroutines below; omitting it leaves a closed-session zombie alive.
         "connect",
         "connect_to_new_endpoint",
         "monitor_current_session",
@@ -6844,8 +6847,12 @@ class SlackAdapter(BasePlatformAdapter):
                 # Cases that must never reach the agent are already handled above:
                 # an explicit @mention of a *different* actor (👀 + return), and
                 # threads we don't own (return).
+                # A bot sender is never "the owner in a 1:1" — its posts always go
+                # through the NO_REPLY gate, or two bots ack each other forever
+                # (2026-09-10: cookie.alter acked every Kitty.Alter post).
                 if (
                     self._slack_alter_thread_heuristic()
+                    and not is_bot_message
                     and thread_human_count is not None
                     and thread_human_count <= 1
                 ):

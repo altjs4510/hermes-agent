@@ -3619,6 +3619,41 @@ class TestThreadReplyHandling:
         assert "NO_REPLY" not in (msg_event.channel_prompt or "")
 
     @pytest.mark.asyncio
+    async def test_alter_thread_heuristic_bot_sender_keeps_no_reply_gate(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """A bot post in a one-human thread is not the owner's 1:1 follow-up —
+        it must carry NO_REPLY, or two alters ack each other forever
+        (2026-09-10 cookie.alter ↔ Kitty.Alter)."""
+        adapter_with_session_store.config.extra["alter_thread_heuristic"] = True
+        adapter_with_session_store.config.extra["allow_bots"] = "all"
+        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        mock_session_store._entries = {session_key: MagicMock()}
+        adapter_with_session_store._app.client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"text": "<@U_BOT> root", "user": "U_USER", "ts": "123.000"},
+                {"text": "답변 드릴게요", "user": "UOTHERBOT", "bot_id": "BOTHERBOT", "ts": "123.456"},
+            ]
+        })
+
+        event = {
+            "text": "답변 드릴게요",
+            "user": "UOTHERBOT",
+            "bot_id": "BOTHERBOT",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+
+        await adapter_with_session_store._handle_slack_message(event)
+
+        adapter_with_session_store.handle_message.assert_called_once()
+        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
+        assert "NO_REPLY" in (msg_event.channel_prompt or "")
+
+    @pytest.mark.asyncio
     async def test_human_mentioning_other_bot_in_active_thread_yields(
         self, adapter_with_session_store, mock_session_store
     ):
