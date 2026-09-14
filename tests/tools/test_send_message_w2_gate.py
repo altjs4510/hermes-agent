@@ -62,7 +62,7 @@ def _invoke(session_env, *, owner_ids="U_OWNER"):
          patch("gateway.mirror.mirror_to_session", return_value=True), \
          patch.dict("os.environ", {"HERMES_OWNER_IDS": owner_ids}, clear=False):
         result = json.loads(
-            send_message_tool({"action": "send", "target": "slack:C123456", "message": "hi"})
+            send_message_tool({"action": "send", "target": "slack:C0123456789", "message": "hi"})
         )
     return result, approval_mock, audit_mock
 
@@ -95,7 +95,7 @@ def test_non_owner_on_behalf_blocked_and_escalated():
                new=AsyncMock(return_value={"success": True})) as send_mock, \
          patch.dict("os.environ", {"HERMES_OWNER_IDS": "U_OWNER"}, clear=False):
         result = json.loads(
-            send_message_tool({"action": "send", "target": "slack:C123456", "message": "hi 조이"})
+            send_message_tool({"action": "send", "target": "slack:C0123456789", "message": "hi 조이"})
         )
     assert result["success"] is False
     assert result["blocked"] is True
@@ -128,7 +128,7 @@ def test_on_behalf_block_records_audit_even_if_escalation_fails():
                new=AsyncMock(return_value={"success": True})) as send_mock, \
          patch.dict("os.environ", {"HERMES_OWNER_IDS": "U_OWNER"}, clear=False):
         result = json.loads(
-            send_message_tool({"action": "send", "target": "slack:C123456", "message": "hi"})
+            send_message_tool({"action": "send", "target": "slack:C0123456789", "message": "hi"})
         )
     assert result["blocked"] is True
     send_mock.assert_not_awaited()
@@ -159,7 +159,7 @@ def test_w4_delegation_allows_on_behalf_send():
          patch("gateway.mirror.mirror_to_session", return_value=True), \
          patch.dict("os.environ", {"HERMES_OWNER_IDS": "U_OWNER"}, clear=False):
         result = json.loads(
-            send_message_tool({"action": "send", "target": "slack:C123456", "message": "hi 조이"})
+            send_message_tool({"action": "send", "target": "slack:C0123456789", "message": "hi 조이"})
         )
     assert result["success"] is True            # delegation → send proceeds
     block_mock.assert_not_called()               # NOT blocked

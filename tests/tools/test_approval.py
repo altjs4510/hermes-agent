@@ -1504,7 +1504,8 @@ class TestApprovalTimeoutIsNotConsent:
         assert "r" in result_holder, "side-effect approval wait did not return"
         assert result_holder["r"]["approved"] is True
         assert result_holder["r"]["choice"] == "once"
-        assert notified == [
+        # request_id is the per-request id upstream's coalescing queue stamps on each entry.
+        assert [{k: v for k, v in n.items() if k != "request_id"} for n in notified] == [
             {
                 "command": "send_message platform=slack target=U123\n\nhello",
                 "pattern_key": "tool:send_message:slack",
