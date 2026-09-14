@@ -83,7 +83,8 @@ _EXPLICIT: dict[str, str] = {
     # path needed `terminal`=exec, owner-only). See tools/slack_list_todo_tool.py.
     "slack_list_todo": "task_ops",
     # send — external messaging
-    "send_message": "send", "discord": "send",
+    # update_message edits what the bot already said — an outbound act, same floor as send.
+    "send_message": "send", "update_message": "send", "discord": "send",
     "feishu_drive_reply_comment": "send", "feishu_drive_add_comment": "send",
     "yb_send_dm": "send", "yb_send_sticker": "send",
     # browse — browser interaction
