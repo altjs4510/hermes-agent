@@ -406,8 +406,18 @@ def _copy_auth_file(src_file: str, dst_file: str) -> bool:
             # SQLite must coordinate both ends: immutable ignores committed source WAL,
             # while replacing only the destination file can replay its abandoned WAL.
             # Connection busy timeouts do not bound backup's retry loop; its callback does.
-            with contextlib.closing(sqlite3.connect(
-                    Path(src_file).resolve().as_uri() + "?mode=ro", uri=True, timeout=0.0)) as source:
+            src_uri = Path(src_file).resolve().as_uri() + "?mode=ro"
+            # Chrome's auth DBs use a rollback journal (no "-wal" beside them), so there is no
+            # committed WAL an immutable read could miss — and macOS Chrome 153+ keeps them
+            # locked while running, so a locking read stays BUSY until the deadline. Read them
+            # lock-free unless a transaction is in flight (hot, non-empty journal).
+            # ponytail: journal-size probe is a heuristic; if torn copies ever show up, retry the
+            # immutable read when the source mtime changed during the backup.
+            journal = src_file + "-journal"
+            if not os.path.exists(src_file + "-wal") and (
+                    not os.path.exists(journal) or os.path.getsize(journal) == 0):
+                src_uri += "&immutable=1"
+            with contextlib.closing(sqlite3.connect(src_uri, uri=True, timeout=0.0)) as source:
                 with contextlib.closing(sqlite3.connect(dst_file, timeout=0.0)) as out:
                     source.backup(out, pages=256, progress=check_deadline, sleep=0.1)
         else:
