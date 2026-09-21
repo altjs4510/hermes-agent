@@ -344,6 +344,15 @@ class TestSocketModeTeardown:
 
 class TestSocketModeRestart:
 
+    @pytest.mark.asyncio
+    async def test_closed_sdk_session_is_treated_as_disconnected(self, adapter):
+        """A closed shared aiohttp session must not be masked by SDK state."""
+        handler = _FakeHandler()
+        setattr(handler.client, "is_connected", lambda: True)
+        handler.client.aiohttp_client_session.closed = True
+        adapter._handler = handler
+
+        assert await adapter._socket_transport_connected() is False
 
     @pytest.mark.asyncio
     async def test_watchdog_restarts_when_transport_disconnected(self, adapter):
