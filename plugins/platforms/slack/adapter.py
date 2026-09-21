@@ -1395,8 +1395,18 @@ class SlackAdapter(BasePlatformAdapter):
         await _cancel_orphaned_client_tasks(client)
 
     async def _socket_transport_connected(self) -> Optional[bool]:
-        """Best-effort check of current Socket Mode transport state."""
-        state = getattr(getattr(self._handler, "client", None), "is_connected", None)
+        """Best-effort check of current Socket Mode transport state.
+
+        The Slack SDK can leave ``is_connected()`` truthy after the shared
+        aiohttp session has been closed. Treat that state as disconnected so
+        the adapter replaces the client instead of letting the SDK retry
+        forever against ``Session is closed``.
+        """
+        client = getattr(self._handler, "client", None)
+        session = getattr(client, "aiohttp_client_session", None)
+        if bool(getattr(session, "closed", False)):
+            return False
+        state = getattr(client, "is_connected", None)
         if state is None:
             return None
         try:
