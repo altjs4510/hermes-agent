@@ -46,7 +46,7 @@ def _reset_cache():
 
 
 def _match(entries, tmp_path, **kw):
-    import yaml
+    import hermes_yaml as yaml
     _write_registry(tmp_path, yaml.safe_dump({"delegations": entries}))
     with patch("gateway.delegations._registry_path", return_value=tmp_path / "delegations.yaml"), \
          patch.dict("os.environ", {"HERMES_OWNER_IDS": OWNER}, clear=False):

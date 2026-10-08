@@ -71,7 +71,7 @@ def _load():
     if _cache["path"] == path and _cache["mtime"] == mtime and _cache["by_id"]:
         return
     try:
-        import yaml
+        import hermes_yaml as yaml
         doc = yaml.safe_load(open(path, encoding="utf-8"))
     except Exception:
         return  # keep stale cache rather than wipe on a transient read error

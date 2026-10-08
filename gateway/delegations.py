@@ -74,7 +74,7 @@ def _load_entries() -> list[dict]:
         if _cache["mtime"] == mtime:
             return _cache["entries"]
     try:
-        import yaml
+        import hermes_yaml as yaml
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         entries = data.get("delegations") or []
         if not isinstance(entries, list):

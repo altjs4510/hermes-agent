@@ -78,7 +78,7 @@ def _load_policy() -> dict:
         if _cache["mtime"] == mtime and _cache["policy"] is not None:
             return _cache["policy"]
     try:
-        import yaml
+        import hermes_yaml as yaml
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         policy = {
             "roles": data.get("roles") or {},
