@@ -1208,6 +1208,26 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         _use_authz = _enforce_authz and _authz_blocked is not None
         _effective_blocked = _authz_blocked if _use_authz else _blocked
 
+        # Owner-private MCP servers (config ``mcp_servers.<name>.owner_only: true``). ms365 acts as
+        # the owner's own mailbox/Teams/SharePoint, so even its *reads* leak private data — authz
+        # classifies those as plain ``read``. Hidden from every non-owner tier, executives included.
+        # Config unreadable → hide all MCP tools (fail closed).
+        try:
+            from hermes_cli.config import load_config_readonly as _load_mcp_cfg
+            from tools.mcp_tool_schema import MCP_TOOL_NAME_PREFIX, sanitize_mcp_name_component
+            _private_mcp_prefixes = tuple(
+                f"{MCP_TOOL_NAME_PREFIX}{sanitize_mcp_name_component(_srv)}__"
+                for _srv, _srv_cfg in (_load_mcp_cfg().get("mcp_servers") or {}).items()
+                if isinstance(_srv_cfg, dict) and _srv_cfg.get("owner_only"))
+        except Exception:
+            logger.warning("Access gate: mcp_servers config unreadable — hiding all MCP tools from non-owner")
+            _private_mcp_prefixes = ("mcp_",)
+        if _private_mcp_prefixes:
+            _base_blocked = _effective_blocked
+
+            def _effective_blocked(name: str) -> bool:  # noqa: F811
+                return name.startswith(_private_mcp_prefixes) or _base_blocked(name)
+
         _before = len(agent.tools)
         _dropped = sorted(
             t.get("function", {}).get("name", "")
