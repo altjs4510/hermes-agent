@@ -1033,6 +1033,9 @@ class TestWindowsLockedProfileCopy:
 
     @pytest.mark.parametrize("locked", ["source", "destination"])
     def test_copy_auth_file_bounds_locks_without_overwriting(self, tmp_path, locked):
+        if locked == "source":
+            pytest.skip("Cookie overlay: a journal-mode source with no hot journal is read immutable "
+                        "(macOS Chrome 153+ holds its auth DBs locked), so a source lock no longer blocks")
         import sqlite3
         import subprocess
         import sys

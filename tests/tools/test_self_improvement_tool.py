@@ -113,7 +113,7 @@ async def test_owner_approval_queues_self_improvement(isolated_paths, monkeypatc
 
     from gateway.config import PlatformConfig
     from gateway.owner_confirm import OwnerConfirmStore
-    from gateway.platforms.slack import SlackAdapter
+    from plugins.platforms.slack.adapter import SlackAdapter
 
     owner = "UOWNER"
     dm = "DOWNER"

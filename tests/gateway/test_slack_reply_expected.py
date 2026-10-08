@@ -26,7 +26,9 @@ def _message(text, ts, **extra):
     ({}, _message("hi", "1.1", channel="D0001", channel_type="im"), True),
     ({}, _message(f"<@{BOT_USER_ID}> hi", "1.2"), True),
     ({}, _message("reaction:added:eyes", "1.3", thread_ts=THREAD, _hermes_force_process=True), True),
-    ({}, _message("done?", "1.4", thread_ts=THREAD), None),
+    # Cookie overlay: an un-@mentioned thread reply carries the NO_REPLY directive (silence is the
+    # default there), so the bare marker must stand → False, not upstream's None.
+    ({}, _message("done?", "1.4", thread_ts=THREAD), False),
     ({}, _message(f"<@{OTHER_USER_ID}> can you check?", "1.5", thread_ts=THREAD), False),
     ({"free_response_channels": CHANNEL_ID}, _message("side chatter", "1.6"), False),
     ({"free_response_channels": CHANNEL_ID, "reply_in_thread": False}, _message("any update?", "1.7"), None),

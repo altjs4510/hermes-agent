@@ -6727,7 +6727,7 @@ class SlackAdapter(BasePlatformAdapter):
             import subprocess
             import sys as _sys
             enr = os.path.expanduser("~/.hermes/scripts/wiki-enrich.py")
-            subprocess.Popen([_sys.executable, enr], start_new_session=True,
+            subprocess.Popen([_sys.executable, enr], start_new_session=True, stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if channel and user_id:
                 try:

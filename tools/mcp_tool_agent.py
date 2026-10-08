@@ -274,7 +274,8 @@ def _reinject_authorized_dynamic_tools(agent, tools_list: list, name_set: set) -
 
     # Non-owner access gate (agent_init._load_tools): a registry rebuild must not re-expose
     # tools the gate dropped at build time. Both publish paths route through here.
-    gate_blocked = getattr(agent, "_access_gate_blocked", None)
+    # Instance attribute only: a Mock agent's auto-attribute would be a truthy "block everything".
+    gate_blocked = getattr(agent, "__dict__", {}).get("_access_gate_blocked")
     if callable(gate_blocked):
         tools_list[:] = [entry for entry in tools_list if not gate_blocked(_def_name(entry))]
         name_set.intersection_update({_def_name(entry) for entry in tools_list})

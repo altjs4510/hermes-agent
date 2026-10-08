@@ -264,4 +264,5 @@ print(json.dumps({"host_send": host_send, "cron": cron,
     payload = json.loads(completed.stdout.strip().splitlines()[-1])
     assert payload["host_send"]["chat_id"] == "@alice@example.com"
     assert payload["cron"]["chat_id"] == "@alice@example.com"
-    assert payload["model_registered"] is False
+    # Cookie overlay: send_message IS a registered model tool (tools/send_message_tool.py registry block).
+    assert payload["model_registered"] is True
