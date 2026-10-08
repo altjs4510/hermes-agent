@@ -250,7 +250,7 @@ def _send_slack(target: str, sent, *, resolves_to: str | None = SLACK_DM):
     """
     import asyncio
     from types import SimpleNamespace
-    from unittest.mock import patch
+    from unittest.mock import AsyncMock, patch
 
     slack_cfg = SimpleNamespace(enabled=True, token="xoxb-t", extra={})
     config = SimpleNamespace(
@@ -273,6 +273,9 @@ def _send_slack(target: str, sent, *, resolves_to: str | None = SLACK_DM):
         "tools.send_message_tool._send_to_platform", side_effect=_record
     ), patch(
         "tools.send_message_tool._resolve_slack_user_target", side_effect=_resolve
+    ), patch(
+        # Cookie overlay: a ``<@U…>`` mention target opens its DM via _open_slack_dm_channel.
+        "tools.send_message_tool._open_slack_dm_channel", new=AsyncMock(return_value=resolves_to)
     ), patch(
         "gateway.mirror.mirror_to_session", return_value=False
     ):
