@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
 
-import agent.secret_scope as secret_scope
+from agent import secret_scope
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import GatewayRunner
 from gateway.platforms.event import MessageEvent, MessageType
@@ -762,7 +762,7 @@ class TestSlackSocketWatchdog:
         """A reconnect must not leave the adapter without a watchdog."""
         adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
         adapter._socket_watchdog_interval_s = 0.01
-        factory, instances = self._make_fake_handler_factory()
+        factory, _instances = self._make_fake_handler_factory()
 
         with contextlib.ExitStack() as stack:
             for p in self._patch_stack(factory):
@@ -5225,7 +5225,6 @@ class TestTrackingStructureBounds:
                 "team_id": "T1",
                 "response_url": f"https://hooks.slack.com/commands/{i}",
             }
-            respond = AsyncMock()  # noqa: F841 — kept for shape clarity
             await adapter._handle_slash_command(command)
         assert len(adapter._slash_command_contexts) <= adapter._SLASH_CTX_MAX
         # Newest stash survives. Keys are workspace-scoped 3-tuples (#20583)
@@ -5532,7 +5531,7 @@ class TestThreadImageContext:
 # Markdown table preprocessing (Slack mrkdwn does not render GFM tables)
 # =========================================================================
 
-from plugins.platforms.slack.adapter import (  # noqa: E402
+from plugins.platforms.slack.adapter import (
     _wrap_markdown_tables,
     _align_table,
     _disp_width,
