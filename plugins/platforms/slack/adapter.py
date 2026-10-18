@@ -301,11 +301,12 @@ def _sdk_supports_agent_sessions() -> bool:
 
 
 def _session_status_method(client: Any):
-    """Return the status setter: Agent Sessions API when available, else legacy."""
-    if _sdk_supports_agent_sessions():
-        method = getattr(client, "agents_sessions_setStatus", None)
-        if method is not None:
-            return method
+    """Return the status setter: always legacy ``assistant.threads.setStatus`` for now.
+
+    ``agents.sessions.setStatus`` takes an enum ``status`` and rejects our free-text phrases
+    (``invalid_arguments: must be a valid enum value``), so the typing indicator silently
+    vanished. Revisit before the Feb 2027 Assistant deprecation.
+    """
     return client.assistant_threads_setStatus
 
 

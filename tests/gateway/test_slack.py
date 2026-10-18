@@ -6598,35 +6598,36 @@ class TestAgentSessionsApiRouting:
         return a
 
     @pytest.mark.asyncio
-    async def test_typing_uses_agent_sessions_when_supported(self):
+    async def test_typing_stays_on_legacy_status_even_when_agent_sessions_supported(self):
+        # agents.sessions.setStatus rejects free-text status (enum only) -> keep legacy.
         _slack_mod._AGENT_SESSIONS_SUPPORTED = True
         a = self._adapter()
         a._app.client.agents_sessions_setStatus = AsyncMock()
         a._app.client.assistant_threads_setStatus = AsyncMock()
         await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
-        a._app.client.agents_sessions_setStatus.assert_called_once_with(
+        a._app.client.assistant_threads_setStatus.assert_called_once_with(
             channel_id="C123",
             thread_ts="parent_ts",
             status="is thinking...",
         )
-        a._app.client.assistant_threads_setStatus.assert_not_called()
+        a._app.client.agents_sessions_setStatus.assert_not_called()
 
 
     @pytest.mark.asyncio
-    async def test_stop_typing_clears_via_agent_sessions(self):
+    async def test_stop_typing_clears_via_legacy_status(self):
         _slack_mod._AGENT_SESSIONS_SUPPORTED = True
         a = self._adapter()
         a._app.client.agents_sessions_setStatus = AsyncMock()
         a._app.client.assistant_threads_setStatus = AsyncMock()
         await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
-        a._app.client.agents_sessions_setStatus.reset_mock()
+        a._app.client.assistant_threads_setStatus.reset_mock()
         await a.stop_typing("C123", metadata={"thread_id": "parent_ts"})
-        a._app.client.agents_sessions_setStatus.assert_called_once_with(
+        a._app.client.assistant_threads_setStatus.assert_called_once_with(
             channel_id="C123",
             thread_ts="parent_ts",
             status="",
         )
-        a._app.client.assistant_threads_setStatus.assert_not_called()
+        a._app.client.agents_sessions_setStatus.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_thread_title_uses_agents_sessions_rename(self):
