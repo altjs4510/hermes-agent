@@ -548,7 +548,7 @@ class TestSlackConnectCleanup:
             ),
             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}),
             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)),
-            patch("gateway.status.release_scoped_lock"),
+            patch("gateway.status_scoped_locks.release_scoped_lock"),
             patch("asyncio.create_task", side_effect=_fake_create_task),
         ):
             result = await adapter.connect()
@@ -557,7 +557,7 @@ class TestSlackConnectCleanup:
         first_handler.close_async.assert_awaited_once_with()
         assert adapter._handler is second_handler
 
-        with patch("gateway.status.release_scoped_lock"):
+        with patch("gateway.status_scoped_locks.release_scoped_lock"):
             await adapter.disconnect()
 
     @pytest.mark.asyncio
@@ -595,7 +595,7 @@ class TestSlackConnectCleanup:
         adapter._proxy_url = "http://proxy.example.com:3128"
         adapter._bot_user_id = "U_BOT"
 
-        with patch("gateway.status.release_scoped_lock") as mock_release:
+        with patch("gateway.status_scoped_locks.release_scoped_lock") as mock_release:
             await adapter.disconnect()
 
         handler.close_async.assert_awaited_once_with()
@@ -685,7 +685,7 @@ class TestSlackSocketWatchdog:
             patch.object(_slack_mod, "AsyncSocketModeHandler", fake_factory),
             patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}),
             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)),
-            patch("gateway.status.release_scoped_lock"),
+            patch("gateway.status_scoped_locks.release_scoped_lock"),
         ]
 
 
@@ -4079,7 +4079,8 @@ class TestAssistantThreadLifecycle:
 
         msg_event = assistant_adapter.handle_message.await_args.args[0]
         assert msg_event.source.scope_id == "T_OTHER"
-        assert msg_event.metadata["slack_team_id"] == "T_OTHER"
+        # Native admission rejects adapter-set metadata (reserved for gateway routing keys).
+        assert msg_event.metadata == {}
         assert msg_event.source.thread_id == "171.111"
         assert msg_event.text.startswith(
             "[Slack app context: user is viewing channel C_ACTIVE]"
@@ -4130,7 +4131,7 @@ class TestAssistantThreadLifecycle:
             title="Please summarize this incident thread",
         )
         msg_event = assistant_adapter.handle_message.call_args[0][0]
-        assert msg_event.metadata["slack_team_id"] == "T_TEAM"
+        assert msg_event.source.scope_id == "T_TEAM"
 
 
 # ---------------------------------------------------------------------------
@@ -4961,7 +4962,7 @@ class TestThreadContextUnverifiedTagging:
         adapter._thread_context_cache.clear()
         adapter._app.client.conversations_replies = self._make_replies(self._thread_messages())
         adapter.set_authorization_check(
-            lambda user_id, chat_type=None, chat_id=None: user_id == "U_BOB"
+            lambda user_id, chat_type=None, chat_id=None, **_: user_id == "U_BOB"
         )
 
         with patch.object(
@@ -4981,18 +4982,18 @@ class TestThreadContextUnverifiedTagging:
 
     @pytest.mark.asyncio
     async def test_auth_check_chat_type_and_id_passed(self, adapter):
-        """The adapter forwards chat_type='thread' and the channel_id so the
-        gateway-side check can resolve group-allowlist rules correctly."""
+        """The adapter forwards the inbound chat type ('group' for a channel), channel_id and
+        thread root, so the gateway check reads the allowlist the live message used."""
         adapter._thread_context_cache.clear()
         adapter._app.client.conversations_replies = self._make_replies(
             [{"ts": "100.0", "user": "U_X", "text": "hello"}]
         )
 
         captured = {}
-        def check(user_id, chat_type=None, chat_id=None):
+        def check(user_id, chat_type=None, chat_id=None, thread_id=None):
             captured["user_id"] = user_id
             captured["chat_type"] = chat_type
-            captured["chat_id"] = chat_id
+            captured.update(chat_id=chat_id, thread_id=thread_id)
             return True
         adapter.set_authorization_check(check)
 
@@ -5004,7 +5005,7 @@ class TestThreadContextUnverifiedTagging:
                 channel_id="C_CHAN", thread_ts="100.0", current_ts="999.0",
             )
 
-        assert captured == {"user_id": "U_X", "chat_type": "thread", "chat_id": "C_CHAN"}
+        assert captured == {"user_id": "U_X", "chat_type": "group", "chat_id": "C_CHAN", "thread_id": "100.0"}
 
 
     @pytest.mark.asyncio
@@ -6643,7 +6644,6 @@ class TestAgentSessionsApiRouting:
             title="Summarize the incident",
         )
         a._app.client.assistant_threads_setTitle.assert_not_called()
-
 
 
 # ---------------------------------------------------------------------------
