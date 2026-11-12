@@ -206,8 +206,9 @@ def check_slack_list_todo_requirements() -> bool:
 SLACK_LIST_TODO_SCHEMA = {
     "name": "slack_list_todo",
     "description": (
-        "Manage 쿠키's single-shot todo list (the Slack List that is the source "
-        "of truth since the 2026-05-29 cutover). Use this for '쿠키 todo 등록/조회/완료' "
+        "Manage 쿠키's single-shot todo list (the Slack List SoT). "
+        "It has been the source of truth since the 2026-05-29 cutover. "
+        "Use this for '쿠키 todo 등록/조회/완료' "
         "— NOT the internal `todo` tool (that is a per-session scratchpad, a "
         "different store). action=add registers a new todo; action=list shows open "
         "todos with ids; action=complete marks one done (needs item_id from list)."

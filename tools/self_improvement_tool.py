@@ -561,8 +561,8 @@ def setup_stale_cleanup_cron(
 PROPOSE_SCHEMA = {
     "name": "propose_self_improvement",
     "description": (
-        "Record feedback ABOUT YOURSELF (the bot/assistant) from a non-owner and route an "
-        "improvement plan to the owner (쿠키) for confirmation. USE THIS — do not refuse — when "
+        "Record a non-owner's feedback about YOU and route it to the owner (쿠키). "
+        "The owner confirms the improvement plan before anything changes. USE THIS — do not refuse — when "
         "someone who is not the owner gives feedback, a complaint, or an improvement request about "
         "how you behave, answer, or are configured (tone, accuracy, missing knowledge, a workflow "
         "you should change, a persona/SOUL tweak, etc.), whether explicit ('피드백:') or implied. "

@@ -6,6 +6,17 @@ import pytest
 
 FOCUS = {'agent': {'coding_context': 'focus'}, 'platform_toolsets': {'cli': ['terminal'], 'acp': ['terminal']}}
 
+# Cookie overlay: the ``messaging`` toolset (send_message/update_message) is folded into every
+# non-coding session — the alter has to be able to reply on Slack from any surface (toolsets.py).
+# Upstream's expectations enumerate exact toolset tuples, so drop the overlay-only entries first.
+# Behaviour predates this merge (same on 4bdfdab); the coding posture still drops messaging.
+OVERLAY_ALWAYS_ON = {'messaging'}
+
+
+def picked(toolsets):
+    """*toolsets* without the Cookie overlay's always-on entries."""
+    return tuple(t for t in toolsets if t not in OVERLAY_ALWAYS_ON)
+
 
 def create(params, config, **kwargs):
     """The ``session.create`` build (``stage_local_session``), the one caller that opts in."""
@@ -36,14 +47,14 @@ def test_surface_toolsets_still_fold_in_over_the_posture(project):
 def test_profile_default_outside_a_workspace_or_without_focus(project, tmp_path):
     plain = tmp_path / 'notes'
     plain.mkdir()
-    assert create({'source': 'cli', 'cwd': str(plain)}, FOCUS).toolsets == ('terminal',)
+    assert picked(create({'source': 'cli', 'cwd': str(plain)}, FOCUS).toolsets) == ('terminal',)
     auto = {**FOCUS, 'agent': {'coding_context': 'auto'}}
-    assert create({'source': 'cli', 'cwd': str(project)}, auto).toolsets == ('terminal',)
+    assert picked(create({'source': 'cli', 'cwd': str(project)}, auto).toolsets) == ('terminal',)
 
 
 def test_an_explicit_pick_wins_over_the_posture(project):
     policy = create({'source': 'cli', 'cwd': str(project), 'toolsets': ['terminal']}, FOCUS)
-    assert policy.toolsets == ('terminal',)
+    assert picked(policy.toolsets) == ('terminal',)
 
 
 def test_a_following_session_keeps_the_posture_for_its_own_cwd(project):
@@ -56,7 +67,7 @@ def test_a_project_file_written_mid_session_does_not_switch_toolsets(tmp_path):
     plain.mkdir()
     policy = create({'source': 'cli', 'cwd': str(plain), 'follow_profile_config': True}, FOCUS)
     (plain / 'pyproject.toml').write_text('[project]\nname = "late"\n')
-    assert policy.current_toolsets(FOCUS) == ('terminal',)
+    assert picked(policy.current_toolsets(FOCUS)) == ('terminal',)
 
 
 def test_plugin_mcp_servers_stay_in_the_posture(project, monkeypatch):
@@ -83,13 +94,13 @@ def test_a_profile_default_listing_coding_is_not_replayed_as_a_workspace(tmp_pat
 @pytest.mark.parametrize('params', [{'source': 'tool'}, {'source': 'cli', 'toolsets': ['terminal']}])
 def test_tool_sources_and_picks_keep_their_toolsets_in_a_workspace(project, params):
     policy = create({**params, 'cwd': str(project)}, FOCUS)
-    assert not policy.coding_posture and policy.toolsets == ('terminal',)
+    assert not policy.coding_posture and picked(policy.toolsets) == ('terminal',)
 
 
 def test_only_session_create_opts_into_the_workspace_posture(project):
     # Kanban workers, legacy-row adoption, cron and hosted rooms build without opting in.
     from gateway.session_policy import build_policy
-    assert build_policy({'source': 'cli', 'cwd': str(project)}, FOCUS).toolsets == ('terminal',)
+    assert picked(build_policy({'source': 'cli', 'cwd': str(project)}, FOCUS).toolsets) == ('terminal',)
 
 
 @pytest.mark.asyncio
@@ -126,6 +137,6 @@ def test_a_following_session_takes_a_profile_coding_context_change(project, tmp_
     (home / 'config.yaml').write_text(json.dumps(config))
     policy = create({'source': 'cli', 'cwd': str(project), 'follow_profile_config': True}, config)
     authority = SimpleNamespace(db=SimpleNamespace(db_path=str(home / 'state.db')))
-    assert policy.current_toolsets(policy.config(authority, secrets=False)) == ('coding',)
+    assert picked(policy.current_toolsets(policy.config(authority, secrets=False))) == ('coding',)
     (home / 'config.yaml').write_text(json.dumps({**config, 'agent': {'coding_context': 'off'}}))
-    assert policy.current_toolsets(policy.config(authority, secrets=False)) == ('terminal',)
+    assert picked(policy.current_toolsets(policy.config(authority, secrets=False))) == ('terminal',)

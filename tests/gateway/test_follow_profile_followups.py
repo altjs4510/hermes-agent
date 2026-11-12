@@ -228,7 +228,10 @@ async def test_follow_session_runs_the_profiles_current_toolsets_and_a_frozen_on
         # The toolsets the turn's agent is built with (``_run_agent_display_settings``).
         assert set(policy.current_toolsets(policy.config(authority))) == before['follow'] - {'web'}
         with policy_scope(policy_for_source(runner, pinned.source), authority=authority):
-            assert set(active_policy().toolsets) == before['pinned'] == {'web'}
+            # Cookie overlay: ``messaging`` is always folded in (toolsets.py), so compare the pick
+            # itself rather than the exact set upstream expects.
+            assert set(active_policy().toolsets) == before['pinned']
+            assert before['pinned'] - {'messaging'} == {'web'}
     finally:
         await owner.close()
         store.close_all_db_handles()

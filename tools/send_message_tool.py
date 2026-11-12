@@ -1569,8 +1569,8 @@ SEND_MESSAGE_SCHEMA = {
 UPDATE_MESSAGE_SCHEMA = {
     "name": "update_message",
     "description": (
-        "Edit a message THIS bot previously sent on a messaging platform — e.g. to "
-        "correct a mistake the owner pointed out. Only the bot's own messages can be "
+        "Edit a message THIS bot previously sent on a messaging platform. "
+        "Use it e.g. to correct a mistake the owner pointed out. Only the bot's own messages can be "
         "edited (platform rule).\n\n"
         "Provide 'target' (same format as send_message: 'slack:#channel' or "
         "'slack:CHANNELID') and 'new_message' (the full replacement text — editing "
