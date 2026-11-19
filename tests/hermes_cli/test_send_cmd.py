@@ -459,3 +459,40 @@ def test_help_and_empty_list_hint_name_the_resolved_home(tmp_path, monkeypatch, 
     out = capsys.readouterr().out
     assert str(home / "channel_directory.json") in out
     assert "~/.hermes" not in out
+
+
+# ---------------------------------------------------------------------------
+# --edit (Cookie: rewrite a Slack message the bot already posted)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fake_update(monkeypatch):
+    import sys
+    import types
+
+    fake = _FakeTool({"success": True, "platform": "slack", "chat_id": "C1", "message_id": "1.2"})
+    mod = types.ModuleType("tools.send_message_tool")
+    mod.update_message_tool = fake
+    mod.send_message_tool = _FakeTool({"error": "send must not be called"})
+    monkeypatch.setitem(sys.modules, "tools.send_message_tool", mod)
+    monkeypatch.setattr(send_cmd, "_load_hermes_env", lambda: None)
+    return fake
+
+
+def test_edit_routes_to_update_message_tool(fake_update, capsys):
+    args = _parse(["--to", "slack:C1:9.9", "--edit", "1.2", "fixed text"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+    assert exc.value.code == 0
+    assert fake_update.calls == [{"target": "slack:C1:9.9", "new_message": "fixed text", "message_ts": "1.2"}]
+
+
+@pytest.mark.parametrize("argv", [
+    ["--to", "telegram:123", "--edit", "1.2", "x"],
+    ["--to", "whatsapp:1@g.us", "--mention", "15550000001", "--edit", "1.2", "x"],
+])
+def test_edit_rejects_non_slack_or_mentions(fake_update, argv):
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(_parse(argv))
+    assert exc.value.code == 2
+    assert fake_update.calls == []

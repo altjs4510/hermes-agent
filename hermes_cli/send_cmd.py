@@ -229,6 +229,18 @@ def cmd_send(args: argparse.Namespace) -> None:
     if subject:
         message = f"{subject}\n\n{message.lstrip()}"
 
+    edit_ts = (getattr(args, "edit", None) or "").strip()
+    if edit_ts:
+        # Cookie: `--edit TS` rewrites a message the bot already posted (Slack chat.update via the
+        # existing update_message tool) instead of posting a new one.
+        if mentions:
+            _fail("hermes send: --edit cannot be combined with --mention.", _USAGE_EXIT)
+        if target.split(":", 1)[0].strip().lower() != "slack":
+            _fail("hermes send: --edit is only supported for Slack targets.", _USAGE_EXIT)
+        from tools.send_message_tool import update_message_tool
+        result = update_message_tool({"target": target, "new_message": message, "message_ts": edit_ts})
+        sys.exit(_emit_result(result, json_mode=getattr(args, "json", False), quiet=getattr(args, "quiet", False)))
+
     # Lazy import keeps `hermes send --help` fast (no tool registry / gateway config stack).
     from tools.send_message_tool import send_message_tool
 
@@ -256,6 +268,9 @@ _SEND_ARGUMENTS = (
     (("--mention",), dict(dest="mentions", action="append", default=None, metavar="PHONE_OR_JID", help=(
         "WhatsApp only: add a native participant mention. Repeat for multiple recipients; "
         "bare phone numbers are normalized to JIDs. Include each matching @<number> near the start of the message text."))),
+    (("-e", "--edit"), dict(metavar="MESSAGE_TS", default=None, help=(
+        "Slack only: replace the text of a message the bot already posted (its ts, e.g. the "
+        "message_id an earlier send printed) instead of posting a new one. --to names its channel."))),
     (("-l", "--list"), dict(dest="list_targets", action="store_true", default=False,
                             help="List available targets. Optional positional filter: `hermes send --list telegram`.")),
     (("-q", "--quiet"), dict(action="store_true", default=False, help="Suppress stdout on success (exit code only).")),
@@ -286,6 +301,7 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
             "  hermes send --to slack:#eng --subject \"[CI]\" --file build.log\n"
             "  hermes send --to whatsapp:GROUP@g.us --mention 15551234567 \"@15551234567 hello\"\n"
             "  hermes send --to telegram \"MEDIA:./chart.png\"   # send a media attachment\n"
+            "  hermes send --to slack:C0123ABCD --edit 1795131312.813119 --file fixed.md   # edit a sent message\n"
             "  hermes send --list                  # all platforms\n"
             "  hermes send --list telegram         # filter by platform\n"
             "\n"
