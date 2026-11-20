@@ -1045,6 +1045,11 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     _owner_ids = {u.strip() for u in os.getenv("HERMES_OWNER_IDS", "").split(",") if u.strip()}
     _executive_ids = {u.strip() for u in os.getenv("HERMES_EXECUTIVE_IDS", "").split(",") if u.strip()}
     _uid = getattr(agent, "_user_id", None)
+    # Tier joins the tools[] freeze key: an owner turn after a non-owner turn in a shared thread must not
+    # inherit the non-owner's gated pin (2026-11-20: 키티가 연 스레드에서 쿠키 요청에도 terminal 없음).
+    agent._access_tier = "" if not (_uid and _owner_ids) else (
+        "owner" if _uid in _owner_ids else "executive" if _uid in _executive_ids else "other")
+    agent._tool_snapshot_selection = tool_selection_key(enabled_toolsets, disabled_toolsets, agent._access_tier)
     if agent.tools and _uid and _owner_ids and _uid not in _owner_ids:
         _is_executive = _uid in _executive_ids
 
@@ -1114,7 +1119,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
             from gateway import authz
             _actor = get_current_actor(user_id_hint=_uid)
 
-            def _authz_blocked(name: str) -> bool:  # noqa: F811
+            def _authz_blocked(name: str) -> bool:
                 return not authz.evaluate(_actor, capability_of(name)).allow
         except Exception:
             # Any import/actor failure → safe fallback to L1 (never open up by error).
@@ -1140,7 +1145,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         if _private_mcp_prefixes:
             _base_blocked = _effective_blocked
 
-            def _effective_blocked(name: str) -> bool:  # noqa: F811
+            def _effective_blocked(name: str) -> bool:
                 return name.startswith(_private_mcp_prefixes) or _base_blocked(name)
 
         _before = len(agent.tools)

@@ -180,7 +180,8 @@ def refresh_agent_mcp_tools(
     built_generation = registry._generation
     added = _publish_tool_snapshot(
         agent, new_defs, new_names, snapshot_generation=snapshot_generation, built_generation=built_generation,
-        selection=tool_selection_key(enabled, disabled), staged_engine_names=staged_engine_names,
+        selection=tool_selection_key(enabled, disabled, getattr(agent, "__dict__", {}).get("_access_tier", "")),
+        staged_engine_names=staged_engine_names,
         content_aware=content_aware, prefix_registered=prefix_registered)
     backend_before = getattr(agent, "_delegation_backend", None)
     published_gen = getattr(agent, "_tool_snapshot_generation", -1)

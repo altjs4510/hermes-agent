@@ -474,10 +474,14 @@ def session_disabled_toolsets(
     return [*(disabled or ()), *gated] if gated else disabled
 
 
-def tool_selection_key(enabled: Optional[list[str]], disabled: Optional[list[str]]) -> tuple:
+def tool_selection_key(enabled: Optional[list[str]], disabled: Optional[list[str]], access_tier: str = "") -> tuple:
     """The toolset selection a tools[] snapshot was built from, order-free. Recorded next to the registry
-    generation: the tools[] freeze (``tools.mcp_tool_agent``) holds new tools back only while neither moved."""
-    return frozenset(enabled) if enabled is not None else None, frozenset(disabled or ())
+    generation: the tools[] freeze (``tools.mcp_tool_agent``) holds new tools back only while neither moved.
+
+    Cookie overlay: ``access_tier`` (owner / executive / other, "" = ungated) is part of the selection. In a
+    shared Slack thread a non-owner's first turn pins a gated tools[]; without the tier here the owner's next
+    turn looked like "nothing moved" and the freeze held terminal & co. back for the rest of the thread."""
+    return frozenset(enabled) if enabled is not None else None, frozenset(disabled or ()), access_tier or ""
 
 
 def agent_tool_drops(agent: Any) -> frozenset:

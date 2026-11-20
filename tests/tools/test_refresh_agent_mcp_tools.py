@@ -633,3 +633,41 @@ def test_rebuilds_reapply_the_non_owner_access_gate(monkeypatch):
     assert "terminal" not in agent.valid_tool_names
     assert "mcp_ms365_create_event" not in agent.valid_tool_names
     assert {t["function"]["name"] for t in agent.tools} == agent.valid_tool_names
+
+
+def test_owner_turn_after_non_owner_pin_gets_its_tools_back(monkeypatch):
+    """Shared Slack thread (2026-11-20): a teammate's first turn pins a gated tools[] (no terminal).
+    The owner's next turn builds a fresh agent WITH terminal in the same process, same registry
+    generation and same toolsets. The freeze must not hold terminal back — the access tier is part
+    of the selection key. A later non-owner turn still loses it to the re-applied gate."""
+    from tools import registry as registry_mod
+    from toolsets import tool_selection_key
+
+    names = ("read_file", "terminal", "delegate_task")
+    entries = {n: types.SimpleNamespace(name=n, schema=_tool(n)["function"]) for n in names}
+    monkeypatch.setattr(registry_mod.registry, "get_all_entries", lambda: list(entries.values()), raising=False)
+    monkeypatch.setattr(registry_mod.registry, "get_entry", lambda name, **kw: entries.get(name), raising=False)
+    monkeypatch.setattr(_mcp_agent, "persist_agent_tool_names",
+                        lambda agent: _mcp_agent._record_pinned_snapshot(agent, agent.session_id))
+    gen = registry_mod.registry._generation
+
+    def _turn(tier, built, gate=None):
+        a = _agent(built, enabled=["hermes-slack"])
+        a.session_id, a._tool_snapshot_generation, a._access_tier = "shared-thread", gen, tier
+        a._tool_snapshot_selection = tool_selection_key(["hermes-slack"], None, tier)
+        if gate:
+            a._access_gate_blocked = gate
+        return a
+
+    gate = lambda n: n in {"terminal", "delegate_task"}
+    kitty = _turn("other", ["read_file"], gate)
+    _mcp_agent.persist_agent_tool_names(kitty)
+    pin = [_tool("read_file")]
+
+    cookie = _turn("owner", list(names))
+    _mcp_agent.restore_agent_tool_prefix(cookie, pin)
+    assert {"terminal", "delegate_task"} <= cookie.valid_tool_names
+
+    kitty_again = _turn("other", ["read_file"], gate)
+    _mcp_agent.restore_agent_tool_prefix(kitty_again, [_tool(n) for n in names])
+    assert kitty_again.valid_tool_names == {"read_file"}
