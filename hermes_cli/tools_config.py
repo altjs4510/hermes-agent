@@ -616,7 +616,13 @@ def _get_platform_tools(config: dict, platform: str, *, include_default_mcp_serv
     else:
         enabled_toolsets = _composite_toolsets(toolset_names, platform, explicitly_configured)
 
-    _recover_platform_native_toolsets(enabled_toolsets, platform, skip=configurable_keys | plugin_ts_keys | platform_default_keys)
+    recover_skip = configurable_keys | plugin_ts_keys | platform_default_keys
+    if explicitly_configured and not toolset_names:
+        # Cookie overlay: ``messaging`` is a platform-native toolset here (send/update_message ride in
+        # every composite), so recovery would hand it back to an explicit EMPTY list — which must stay
+        # a zero-tool state (#82010).
+        recover_skip = recover_skip | {"messaging"}
+    _recover_platform_native_toolsets(enabled_toolsets, platform, skip=recover_skip)
     if plugin_ts_keys:
         enabled_toolsets |= _enabled_plugin_toolsets(config, platform, toolset_names, plugin_ts_keys)
 

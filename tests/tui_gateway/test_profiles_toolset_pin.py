@@ -9,12 +9,17 @@ import pytest
 
 from tui_gateway.methods_profiles import _describe_toolsets, _save_toolset_pin
 
+# Cookie overlay: ``messaging`` (send/update_message) is platform-native and rides along with any
+# non-empty pin — the alter must be able to reply from every surface (toolsets.py). Drop it before
+# comparing against upstream's exact pin sets.
+OVERLAY_ALWAYS_ON = {"messaging"}
+
 
 def _pin_and_resolve(cfg: dict, names: list[str]) -> tuple[set[str], set[str] | None]:
     from hermes_cli.tools_config import _get_platform_tools
 
     _save_toolset_pin(cfg, names, save_config=lambda _c: None)
-    resolved = set(_get_platform_tools(cfg, "cli", include_default_mcp_servers=False))
+    resolved = set(_get_platform_tools(cfg, "cli", include_default_mcp_servers=False)) - OVERLAY_ALWAYS_ON
     _toolsets, pinned = _describe_toolsets(cfg)
     return resolved, pinned
 

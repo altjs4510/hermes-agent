@@ -6724,6 +6724,7 @@ class SlackAdapter(BasePlatformAdapter):
             import subprocess
             import sys as _sys
             enr = os.path.expanduser("~/.hermes/scripts/wiki-enrich.py")
+            # detached-spawn: ok — fire-and-forget wiki-enrich pass; short-lived script, also run by its own cron
             subprocess.Popen([_sys.executable, enr], start_new_session=True, stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if channel and user_id:

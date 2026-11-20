@@ -230,6 +230,12 @@ def test_turn_activity_buckets_reach_long_agentic_loops(count, bucket):
     assert bucket in contract.TURN_ACTIVITY_BUCKETS
 
 
+_OVERLAY_ONLY = {
+    "toolset": {"messaging"},
+    "tool_name": {"send_message", "update_message", "cookie_project", "propose_self_improvement", "slack_list_todo"},
+}
+
+
 def test_v3_schema_accepts_exactly_the_contract_values():
     from hermes_cli import observability
 
@@ -244,5 +250,8 @@ def test_v3_schema_accepts_exactly_the_contract_values():
         expected = contract._COUNTER_DIMENSION_VALUES[metric]
         for field_name, spec in dims.items():
             if "enum" in spec:
-                assert set(spec["enum"]) == set(expected[field_name]), (metric, field_name)
+                # Cookie overlay: these toolsets/tools exist only in this deployment, so the contract
+                # (derived from the live registry) carries them while upstream's published schema does not.
+                values = set(expected[field_name]) - _OVERLAY_ONLY.get(field_name, set())
+                assert set(spec["enum"]) == values, (metric, field_name)
         assert set(dims) == set(expected) | ({"model", "provider"} & set(dims)), metric
