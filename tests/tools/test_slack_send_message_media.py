@@ -174,3 +174,83 @@ def test_send_to_platform_routes_slack_media():
     finally:
         entry.standalone_sender_fn = original
         os.unlink(pdf)
+
+
+def test_multiple_files_go_out_as_one_message_with_text():
+    """Cookie: 2+ files → one files_upload_v2(file_uploads=...) carrying the text as
+    initial_comment — not a text post followed by one message per file."""
+    paths = [_tmpfile(ext) for ext in (".csv", ".csv", ".json")]
+    client = _mock_client()
+    client.files_upload_v2 = AsyncMock(return_value={
+        "ok": True, "files": [{"id": "F1", "shares": {"private": {"C012AB3CD": [{"ts": "555.666"}]}}}]})
+    try:
+        with _fake_slack_sdk(client):
+            result = asyncio.run(_standalone_send(
+                _pconfig(), "C012AB3CD", "<@U123> 파일 공유", media_files=[(p, False) for p in paths]))
+        assert result["success"] is True
+        assert result["message_id"] == "555.666"
+        client.chat_postMessage.assert_not_awaited()
+        client.files_upload_v2.assert_awaited_once()
+        kwargs = client.files_upload_v2.await_args.kwargs
+        assert [u["file"] for u in kwargs["file_uploads"]] == paths
+        assert [u["filename"] for u in kwargs["file_uploads"]] == [os.path.basename(p) for p in paths]
+        assert kwargs["initial_comment"] == "<@U123> 파일 공유"
+    finally:
+        for p in paths:
+            os.unlink(p)
+
+
+def test_multiple_files_batches_of_ten_comment_only_on_first():
+    paths = [_tmpfile(".csv") for _ in range(12)]
+    client = _mock_client()
+    try:
+        with _fake_slack_sdk(client):
+            result = asyncio.run(_standalone_send(
+                _pconfig(), "C012AB3CD", "hello", media_files=[(p, False) for p in paths],
+                thread_id="999.000"))
+        assert result["success"] is True
+        calls = client.files_upload_v2.await_args_list
+        assert [len(c.kwargs["file_uploads"]) for c in calls] == [10, 2]
+        assert [c.kwargs["initial_comment"] for c in calls] == ["hello", ""]
+        assert all(c.kwargs["thread_ts"] == "999.000" for c in calls)
+    finally:
+        for p in paths:
+            os.unlink(p)
+
+
+def test_multiple_files_batch_failure_falls_back_per_file():
+    paths = [_tmpfile(".csv") for _ in range(2)]
+    client = _mock_client()
+    single = {"ok": True, "file": {"id": "F1", "shares": {"public": {"C012AB3CD": [{"ts": "333.444"}]}}}}
+
+    async def upload(**kwargs):
+        if "file_uploads" in kwargs:
+            raise RuntimeError("batch boom")
+        return single
+    client.files_upload_v2 = AsyncMock(side_effect=upload)
+    try:
+        with _fake_slack_sdk(client):
+            result = asyncio.run(_standalone_send(
+                _pconfig(), "C012AB3CD", "hello", media_files=[(p, False) for p in paths]))
+        assert result["success"] is True
+        client.chat_postMessage.assert_awaited_once()  # legacy path: text post + per-file
+        assert client.files_upload_v2.await_count == 3
+    finally:
+        for p in paths:
+            os.unlink(p)
+
+
+def test_multiple_files_missing_one_is_warned_and_rest_batched():
+    paths = [_tmpfile(".csv") for _ in range(2)]
+    client = _mock_client()
+    try:
+        with _fake_slack_sdk(client):
+            result = asyncio.run(_standalone_send(
+                _pconfig(), "C012AB3CD", "", media_files=[(p, False) for p in paths] + [("/nope.csv", False)]))
+        assert result["success"] is True
+        client.files_upload_v2.assert_awaited_once()
+        assert len(client.files_upload_v2.await_args.kwargs["file_uploads"]) == 2
+        assert any("/nope.csv" in w for w in result["warnings"])
+    finally:
+        for p in paths:
+            os.unlink(p)

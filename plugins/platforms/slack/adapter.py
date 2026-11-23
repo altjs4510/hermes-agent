@@ -8103,27 +8103,107 @@ async def _standalone_upload_file(
     payload = _slack_response_payload(result)
     if payload.get("ok") is False:
         return send_error(f"Slack API error: {payload.get('error', 'unknown')}")
-    # files_upload_v2 responses vary by sdk version; prefer file timestamp when present.
+    return {"success": True, "message_id": _upload_message_ts(payload), "raw": result}
+
+
+def _upload_message_ts(payload: dict[str, Any]) -> Optional[str]:
+    """Message ts of a ``files_upload_v2`` response (single ``file`` or multi ``files``);
+    responses vary by sdk version, so prefer the share ts, then file timestamp, then ``ts``."""
+    if not payload:
+        return None
+    files = payload.get("files")
+    file_obj = payload.get("file") or (files[0] if isinstance(files, list) and files else {}) or {}
+    if not isinstance(file_obj, dict):
+        file_obj = {}
     message_id = None
-    if payload:
-        file_obj = payload.get("file") or {}
-        shares = file_obj.get("shares") or {}
-        for share_bucket in shares.values():
-            if isinstance(share_bucket, dict):
-                for entries in share_bucket.values():
-                    if isinstance(entries, list) and entries:
-                        message_id = entries[0].get("ts") or message_id
-                        break
-            if message_id:
-                break
-        message_id = message_id or file_obj.get("timestamp") or payload.get("ts")
-    return {"success": True, "message_id": message_id, "raw": result}
+    shares = file_obj.get("shares") or {}
+    for share_bucket in shares.values():
+        if isinstance(share_bucket, dict):
+            for entries in share_bucket.values():
+                if isinstance(entries, list) and entries:
+                    message_id = entries[0].get("ts") or message_id
+                    break
+        if message_id:
+            break
+    return message_id or file_obj.get("timestamp") or payload.get("ts")
+
+
+_SLACK_UPLOAD_BATCH = 10  # files_upload_v2(file_uploads=...) cap per call
+
+
+async def _standalone_upload_batch(
+    client, chat_id: str, paths: list[str], *, initial_comment: str = "",
+    thread_id: Optional[str] = None) -> dict[str, Any]:
+    """One ``files_upload_v2(file_uploads=...)`` call — every file lands in ONE Slack message."""
+    kwargs: dict[str, Any] = {
+        "channel": chat_id,
+        "file_uploads": [{"file": p, "filename": os.path.basename(p)} for p in paths],
+        "initial_comment": initial_comment or ""}
+    if thread_id:
+        kwargs["thread_ts"] = thread_id
+    payload = _slack_response_payload(await client.files_upload_v2(**kwargs))
+    if payload.get("ok") is False:
+        return send_error(f"Slack API error: {payload.get('error', 'unknown')}")
+    return {"success": True, "message_id": _upload_message_ts(payload)}
+
+
+async def _standalone_send_media_batched(
+    client, proxy, chat_id: str, paths: list[str], thread_id: Optional[str], text: str,
+    unfurl_kwargs: dict[str, Any], warnings: list[str]) -> Optional[dict[str, Any]]:
+    """Cookie: 2+ files → text + files as ONE message (``initial_comment`` + ``file_uploads``,
+    10 per call) instead of a text post followed by one message per file. Returns None when the
+    very first batch fails before anything was posted, so the caller falls back to the per-file
+    path; a later batch failure falls back per-file for that batch only (no duplicate text)."""
+    last_message_id = None
+    comment = text
+    if text.strip() and unfurl_kwargs:
+        # Upload API cannot carry explicit link-preview controls → text goes as its own post.
+        try:
+            post_payload = await _standalone_post_text(client, chat_id, text, unfurl_kwargs, thread_id)
+            if not post_payload.get("ok", True):
+                return send_error(f"Slack API error: {post_payload.get('error', 'unknown')}")
+            last_message_id = post_payload.get("ts")
+        except Exception as e:
+            return send_error(f"Slack send failed: {describe_proxy_error(e, proxy) or e}")
+        comment = ""
+    sent_any = last_message_id is not None
+    batches = [paths[i:i + _SLACK_UPLOAD_BATCH] for i in range(0, len(paths), _SLACK_UPLOAD_BATCH)]
+    for batch in batches:
+        try:
+            res = await _standalone_upload_batch(
+                client, chat_id, batch, initial_comment=comment, thread_id=thread_id)
+            error = res.get("error")
+        except Exception as e:
+            error = describe_proxy_error(e, proxy) or str(e)
+            res = {}
+        if not error:
+            last_message_id = res.get("message_id") or last_message_id
+            sent_any, comment = True, ""
+            continue
+        logger.warning("[Slack] Multi-file files_upload_v2 failed (%d files): %s", len(batch), error)
+        if not sent_any:
+            return None
+        for path in batch:
+            try:
+                one = await _standalone_upload_file(client, chat_id, path, thread_id=thread_id)
+            except Exception as e:
+                one = {"error": describe_proxy_error(e, proxy) or str(e)}
+            if one.get("error"):
+                warnings.append(f"Failed to send media {path}: {one['error']}")
+            else:
+                last_message_id = one.get("message_id") or last_message_id
+    result: dict[str, Any] = {
+        "success": True, "platform": "slack", "chat_id": chat_id, "message_id": last_message_id}
+    if warnings:
+        result["warnings"] = warnings
+    return result
 
 
 async def _standalone_send_media(
     token: str, chat_id: str, media_files: list, thread_id: Optional[str], formatted: Optional[str],
     formatted_caption: Optional[str], unfurl_kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Media branch of ``_standalone_send``: ``files_upload_v2`` per file (+ optional text post).
+    """Media branch of ``_standalone_send``. 2+ files → one message (``_standalone_send_media_batched``);
+    otherwise (or if that first batch fails) ``files_upload_v2`` per file (+ optional text post).
     ``caption`` rides as ``initial_comment`` on the first successful upload unless
     link-preview controls are explicit (the upload API cannot carry them)."""
     warnings: list[str] = []
@@ -8136,6 +8216,15 @@ async def _standalone_send_media(
         }
     client = _AsyncWebClient(token=token)
     _apply_slack_proxy(client, proxy := resolve_proxy_url())  # every catch below: the error may echo it
+    existing = [path for path, _is_voice in media_files if os.path.exists(path)]
+    if len(existing) >= 2:
+        batch_warnings = [f"Media file not found, skipping: {path}"
+                          for path, _is_voice in media_files if not os.path.exists(path)]
+        batched = await _standalone_send_media_batched(
+            client, proxy, chat_id, existing, thread_id, formatted_caption or formatted or "",
+            unfurl_kwargs, batch_warnings)
+        if batched is not None:
+            return batched
     last_message_id = None
     # The upload API cannot carry unfurl controls; explicit ones need a separate caption post.
     caption_as_upload_comment = bool(formatted_caption) and not unfurl_kwargs
