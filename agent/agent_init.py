@@ -1213,7 +1213,10 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
         # (conversation_loop _strip_non_ascii). Korean examples are nice-to-have under
         # normal UTF-8. The owner mention (Slack/Discord <@id>) needs no tool — it's
         # just text the platform renders as a ping.
-        _owner_mention = " ".join(f"<@{oid}>" for oid in sorted(_owner_ids))
+        # Only chat-platform IDs (Slack U…/Discord digits) can be pinged. Local principals like
+        # `uid:501` (OS account, added so the CLI/pet session is owner) are not mentionable —
+        # rendering them leaked a literal "<@uid:501>" into Slack replies (2026-11-20~24).
+        _owner_mention = " ".join(f"<@{oid}>" for oid in sorted(_owner_ids) if ":" not in oid)
         if _is_executive:
             _access_note = (
                 "ACCESS CONTEXT: The person you are talking to is an EXECUTIVE "

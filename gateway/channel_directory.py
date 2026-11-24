@@ -214,7 +214,8 @@ async def _notify_owner_new_slack_surfaces(
     alerting on the entire pre-existing set."""
     import os
 
-    owner_ids = [u.strip() for u in os.getenv("HERMES_OWNER_IDS", "").split(",") if u.strip()]
+    # `uid:501` 같은 로컬 신원은 Slack 에 DM 할 수 없다 — 플랫폼 ID 만.
+    owner_ids = [u.strip() for u in os.getenv("HERMES_OWNER_IDS", "").split(",") if u.strip() and ":" not in u]
     if not owner_ids:
         return
 
